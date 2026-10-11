@@ -1,0 +1,43 @@
+package auth
+
+import "../../proto"
+import "crucible"
+import "seal"
+
+fn TestNonce(t mut crucible.T) {
+	let key = "a test secret"
+	let n = NewNonce(key, 1000)
+	t.NoFault("fresh", CheckNonce(key, n, 1010))
+	t.HasFault("old", CheckNonce(key, n, 1000 + NonceLife))
+	t.HasFault("other key", CheckNonce("another", n, 1010))
+	t.HasFault("garbage", CheckNonce(key, "!!", 1010))
+}
+
+fn TestVerifyNew(t mut crucible.T) {
+	let key = "a test secret"
+	let seed = seal.RandomBytes(32)
+	let pub = seal.Ed25519PublicKey(seed) catch err {
+		t.Error("key: {err}")
+		return
+	}
+	let nonce = NewNonce(key, 2000)
+	let body = `{"code":"x"}`
+	let bodyHash = seal.Hex(seal.Sha256(body))
+	let text = []u8(proto.SigningText("POST", "/v1/invites/accept", nonce, bodyHash))
+	let sig = seal.SignEd25519(seed, text) catch err {
+		t.Error("sign: {err}")
+		return
+	}
+	let header = proto.Signature("new", nonce, sig)
+	t.NoFault("signed", VerifyNew(key, "POST", "/v1/invites/accept", header, bodyHash, pub, 2001))
+	t.HasFault("other path", VerifyNew(key, "POST", "/v1/links", header, bodyHash, pub, 2001))
+	t.HasFault("other body", VerifyNew(key, "POST", "/v1/invites/accept", header, seal.Hex(seal.Sha256("{{}}")), pub, 2001))
+	let other = seal.Ed25519PublicKey(seal.RandomBytes(32)) catch _ { []u8{} }
+	t.HasFault("other key", VerifyNew(key, "POST", "/v1/invites/accept", header, bodyHash, other, 2001))
+}
+
+fn TestCodes(t mut crucible.T) {
+	let c = newCode(8)
+	crucible.Equal(mut t, "grouped", len(c), 9)
+	crucible.Equal(mut t, "typed loosely", codeHash(c), codeHash(" " + c[0:4] + " " + c[5:9]))
+}

@@ -1,0 +1,44 @@
+package proto
+
+import "crucible"
+import "seal"
+
+fn TestFileHash(t mut crucible.T) {
+	let empty = FileHash([]str{}) catch err {
+		t.Error("empty: {err}")
+		return
+	}
+	crucible.Equal(mut t, "no blocks", empty, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+	let one = BlockHash("hello")
+	let h = FileHash([]str{one}) catch err {
+		t.Error("one: {err}")
+		return
+	}
+	crucible.Equal(mut t, "one block", h, seal.Hex(seal.Sha256(str(seal.Sha256("hello")))))
+	let (_, bad) = FileHash([]str{"xyz"})
+	t.HasFault("bad hash", bad)
+}
+
+fn TestDirHash(t mut crucible.T) {
+	let none = DirHash([]Child{}) catch _ { "" }
+	crucible.Equal(mut t, "empty", EmptyDirHash(), none)
+	let a = Child{Name: "b.txt", Kind: KindFile, Hash: BlockHash("x")}
+	let b = Child{Name: "a", Kind: KindDir, Hash: EmptyDirHash()}
+	let one = DirHash([]Child{a, b}) catch _ { "1" }
+	let two = DirHash([]Child{b, a}) catch _ { "2" }
+	crucible.Equal(mut t, "order does not matter", one, two)
+	let c = Child{Name: "b.txt", Kind: KindExec, Hash: BlockHash("x")}
+	let three = DirHash([]Child{c, b}) catch _ { "3" }
+	t.True("the kind counts", three != one)
+}
+
+fn TestNames(t mut crucible.T) {
+	t.NoFault("plain", CheckName("notes.md"))
+	t.HasFault("empty", CheckName(""))
+	t.HasFault("dot", CheckName("."))
+	t.HasFault("dotdot", CheckName(".."))
+	t.HasFault("slash", CheckName("a/b"))
+	crucible.Equal(mut t, "case", NameKey("Report.PDF"), "report.pdf")
+	t.True("valid", ValidHash(BlockHash("")))
+	t.True("upper is not", !ValidHash("E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"))
+}

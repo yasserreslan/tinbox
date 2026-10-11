@@ -1,0 +1,8 @@
+package tree
+
+import "crucible"
+
+fn TestSplit(t mut crucible.T) {
+	crucible.Equal(mut t, "none", len(splitBlocks("")), 0)
+	crucible.Equal(mut t, "two", len(splitBlocks("a,b")), 2)
+}

@@ -1,0 +1,154 @@
+package db
+
+import "embed"
+import "fault"
+import "mint"
+import "postgres"
+import "seal"
+import "twine"
+
+// tinbox's Postgres: the numbered migrations embedded in the binary, the migrator, and the settings the server keeps
+// for itself. Forward only: a migration is never edited once released; a change is a new file.
+
+// embed: migrations
+let migrationFiles str
+
+// ErrSchema is the fault of a database whose schema does not match the binary.
+let ErrSchema = fault("tinbox schema")
+
+// lockKey is the advisory lock migrations run under: two servers migrating at once apply each migration once.
+const lockKey = 8613_0001
+
+// Migration is one numbered file of migrations/: NNNN_name.sql.
+type Migration struct {
+	Version i64
+	Name    str
+	Text    str
+}
+
+// Migrations is every embedded migration, in version order; a gap, a duplicate or a bad name is a fault.
+fn Migrations() ![]Migration {
+	let tree = try embed.Parse(migrationFiles)
+	let entries = try tree.ReadDir("migrations")
+	mut out = []Migration{}
+	for e in entries {
+		let name = e.Name
+		if !twine.HasSuffix(name, ".sql") {
+			continue
+		}
+		let (num, rest, ok) = twine.Cut(name, "_")
+		if !ok || len(num) != 4 {
+			fail fault.Wrap(ErrSchema, "{name}: want NNNN_name.sql")
+		}
+		let v = mint.Atoi(num) catch _ {
+			fail fault.Wrap(ErrSchema, "{name}: want NNNN_name.sql")
+			0
+		}
+		if v != len(out) + 1 {
+			fail fault.Wrap(ErrSchema, "{name}: migrations are numbered 1, 2, 3 ... with no gap")
+		}
+		let text = try tree.ReadFile("migrations/" + name)
+		out = append(out, Migration{Version: v, Name: rest[0:len(rest) - 4], Text: text})
+	}
+	return out
+}
+
+// Newest is the newest migration the binary knows.
+fn Newest() !i64 {
+	let ms = try Migrations()
+	return len(ms)
+}
+
+// raw is an embedded migration's text as a statement: it comes from the binary, never from a request.
+fn raw(text str) query {
+	return query{Parts: []str{text}, Args: []qarg{}}
+}
+
+// Migrate applies every migration the database lacks, in one transaction under the advisory lock, and records each
+// in schema_migrations. It returns how many it applied.
+fn Migrate(c postgres.Client) !i64 {
+	let ms = try Migrations()
+	mut tx = try c.Begin()
+	let (n, err) = migrateIn(mut tx, ms)
+	if err != nil {
+		tx.Rollback() catch _ {
+		}
+		fail err
+	}
+	try tx.Commit()
+	return n
+}
+
+fn migrateIn(tx mut postgres.Tx, ms []Migration) !i64 {
+	_ = try tx.Query("SELECT pg_advisory_xact_lock({lockKey})")
+	_ = try tx.Exec("CREATE TABLE IF NOT EXISTS schema_migrations (version int PRIMARY KEY, name text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())")
+	let rows = try tx.Query("SELECT coalesce(max(version), 0) FROM schema_migrations")
+	let have = rows.Rows[0][0].Int()
+	if have > len(ms) {
+		fail fault.Wrap(ErrSchema, "the database is at migration {have}, newer than this binary's {len(ms)}")
+	}
+	mut applied = 0
+	for m in ms {
+		if m.Version <= have {
+			continue
+		}
+		_ = try tx.Exec(raw(m.Text)) wrap "migration {m.Version} ({m.Name})"
+		let v = m.Version
+		let name = m.Name
+		_ = try tx.Exec("INSERT INTO schema_migrations (version, name) VALUES ({v}, {name})")
+		applied += 1
+	}
+	return applied
+}
+
+// Applied is the newest migration the database has, 0 for none.
+fn Applied(c postgres.Client) !i64 {
+	let t = try c.Query("SELECT to_regclass('schema_migrations') IS NOT NULL")
+	if t.Rows[0][0].Int() == 0 {
+		return 0
+	}
+	let rows = try c.Query("SELECT coalesce(max(version), 0) FROM schema_migrations")
+	return rows.Rows[0][0].Int()
+}
+
+// Current checks the database has every migration the binary knows, and no newer one.
+fn Current(c postgres.Client) ! {
+	let have = try Applied(c)
+	let want = try Newest()
+	if have < want {
+		fail fault.Wrap(ErrSchema, "the database is at migration {have}, this binary needs {want}: run tinbox migrate")
+	}
+	if have > want {
+		fail fault.Wrap(ErrSchema, "the database is at migration {have}, newer than this binary's {want}: upgrade tinbox")
+	}
+}
+
+// Options is how to reach the database.
+type Options struct {
+	Addr     str
+	User     str
+	Password secret str
+	Name     str
+	SSLMode  str
+	MaxTotal i64
+}
+
+// Open is a client of the database in o; it connects on first use, on each core.
+fn Open(o Options) postgres.Client {
+	return postgres.Open(postgres.Options{Addr: o.Addr, User: o.User, Password: reveal(o.Password), Database: o.Name, Pool: 2, MaxTotal: o.MaxTotal, Timeout: 0, SSLMode: o.SSLMode, TLS: nil})
+}
+
+// NonceSecret is the secret nonces are made with: the configured one, else the one this database keeps, made on
+// first use, so every server on the database agrees with no configuration.
+fn NonceSecret(c postgres.Client, configured secret str) !str {
+	if len(reveal(configured)) > 0 {
+		return reveal(configured)
+	}
+	let fresh = seal.Hex(seal.RandomBytes(32))
+	_ = try c.Exec("INSERT INTO settings (key, value) VALUES ('nonce_secret', {fresh}) ON CONFLICT (key) DO NOTHING")
+	let rows = try c.Query("SELECT value FROM settings WHERE key = 'nonce_secret'")
+	if len(rows.Rows) == 0 {
+		fail fault.Wrap(ErrSchema, "no nonce secret")
+	}
+	return rows.Rows[0][0].Text()
+}

@@ -1,0 +1,121 @@
+package auth
+
+import "../../proto"
+import "fault"
+import "mint"
+import "postgres"
+import "seal"
+import "twine"
+
+// Who is asking (design/backend.md, "Teams, people and Macs"): every request is signed by a device's ed25519 key over
+// tinbox's signing text, with a nonce the server made less than a minute before. The nonce is stateless (its time,
+// random bytes and an HMAC), so any server holding the secret checks it, and a client's clock never matters.
+
+// NonceLife is how many seconds a nonce is good for.
+const NonceLife = 60
+
+// Caller is the device a request was signed by, and its user.
+type Caller struct {
+	Device     i64
+	DeviceName str
+	User       i64
+	Email      str
+	Name       str
+}
+
+fn be64(v i64) []u8 {
+	mut out = make([]u8, 8)
+	for i in 0..8 {
+		out[7 - i] = u8((v >> (8 * i)) & 0xff)
+	}
+	return out
+}
+
+// NewNonce is a nonce for the time now (unix seconds): the time, 16 random bytes and the HMAC of both, in base64.
+fn NewNonce(key secret str, now i64) str {
+	mut raw = be64(now)
+	raw = append(raw, seal.RandomBytes(16)...)
+	let mac = seal.HmacSha256(key, str(raw))
+	raw = append(raw, mac...)
+	return seal.B64(raw)
+}
+
+// CheckNonce checks a nonce's HMAC and that it is younger than NonceLife seconds at now.
+fn CheckNonce(key secret str, nonce str, now i64) ! {
+	let raw = seal.B64Decode(nonce) catch _ {
+		fail fault.Wrap(proto.ErrNonce, "the nonce is not base64")
+	}
+	if len(raw) != 56 {
+		fail fault.Wrap(proto.ErrNonce, "the nonce has {len(raw)} bytes")
+	}
+	let want = seal.HmacSha256(key, str(raw[0:24]))
+	if !seal.ConstantTimeEq(want, raw[24:56]) {
+		fail fault.Wrap(proto.ErrNonce, "the nonce is not this server's")
+	}
+	mut at = 0
+	for i in 0..8 {
+		at = (at << 8) | i64(raw[i])
+	}
+	if now - at >= NonceLife || at > now + 5 {
+		fail fault.Wrap(proto.ErrNonce, "the nonce is {now - at} s old")
+	}
+}
+
+// ParseSignature splits a Tinbox-Signature value into the device ("new" or an id), the nonce and the signature.
+fn ParseSignature(h str) !(str, str, []u8) {
+	let parts = twine.Split(twine.TrimSpace(h), " ")
+	if len(parts) != 3 {
+		fail fault.Wrap(proto.ErrUnauthorized, "Tinbox-Signature has {len(parts)} fields, not 3")
+	}
+	let sig = seal.B64Decode(parts[2]) catch _ {
+		fail fault.Wrap(proto.ErrUnauthorized, "the signature is not base64")
+	}
+	if len(sig) != 64 {
+		fail fault.Wrap(proto.ErrUnauthorized, "a signature of {len(sig)} bytes")
+	}
+	return parts[0], parts[1], sig
+}
+
+// Verify checks a request signed by a registered, unrevoked device and returns it.
+fn Verify(c postgres.Client, key secret str, method str, target str, header str, bodyHash str, now i64) !Caller {
+	if len(header) == 0 {
+		fail fault.Wrap(proto.ErrUnauthorized, "sign the request (Tinbox-Signature)")
+	}
+	let (dev, nonce, sig) = try ParseSignature(header)
+	try CheckNonce(key, nonce, now)
+	let id = mint.Atoi(dev) catch _ {
+		fail fault.Wrap(proto.ErrUnauthorized, "{dev:q} is not a device id")
+		0
+	}
+	let rows = try c.Query("SELECT d.public_key, d.name, u.id, u.email, u.name FROM devices d JOIN users u ON u.id = d.user_id WHERE d.id = {id} AND d.revoked_at IS NULL")
+	if len(rows.Rows) == 0 {
+		fail fault.Wrap(proto.ErrUnauthorized, "no device {id} (revoked, or never registered here)")
+	}
+	let r = rows.Rows[0]
+	let pub = try seal.B64Decode(r[0].Text())
+	let text = []u8(proto.SigningText(method, target, nonce, bodyHash))
+	seal.VerifyEd25519(pub, text, sig) catch _ {
+		fail fault.Wrap(proto.ErrUnauthorized, "the signature is not device {id}'s")
+	}
+	_ = try c.Exec("UPDATE devices SET last_seen = now() WHERE id = {id} AND (last_seen IS NULL OR last_seen < now() - interval '1 minute')")
+	return Caller{Device: id, DeviceName: r[1].Text(), User: r[2].Int(), Email: r[3].Text(), Name: r[4].Text()}
+}
+
+// VerifyNew checks a request signed by a key not registered yet (device "new") against pub, the key it presents.
+fn VerifyNew(key secret str, method str, target str, header str, bodyHash str, pub []u8, now i64) ! {
+	if len(header) == 0 {
+		fail fault.Wrap(proto.ErrUnauthorized, "sign the request with the new key (Tinbox-Signature: new NONCE SIG)")
+	}
+	let (dev, nonce, sig) = try ParseSignature(header)
+	if dev != "new" {
+		fail fault.Wrap(proto.ErrUnauthorized, "this request is signed by the new key, as device \"new\"")
+	}
+	try CheckNonce(key, nonce, now)
+	if len(pub) != 32 {
+		fail fault.Wrap(proto.ErrInvalid, "an ed25519 public key has 32 bytes, not {len(pub)}")
+	}
+	let text = []u8(proto.SigningText(method, target, nonce, bodyHash))
+	seal.VerifyEd25519(pub, text, sig) catch _ {
+		fail fault.Wrap(proto.ErrUnauthorized, "the signature is not the presented key's")
+	}
+}

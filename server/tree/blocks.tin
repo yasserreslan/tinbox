@@ -1,0 +1,250 @@
+package tree
+
+import "../../proto"
+import "../store"
+import "fault"
+import "postgres"
+import "twine"
+
+// Blocks (design/backend.md, decisions 5 and 7): the server hashes every uploaded block before it counts, so a block's
+// key always names its bytes. A block row is written after its object, and the sweep removes an object before its
+// row, both under rules that keep a committed version from ever pointing at a missing block.
+
+// MaxHashes is the most hashes one request may ask about.
+const MaxHashes = 10000
+
+// HashesIn is a request body that lists block hashes.
+type HashesIn struct {
+	@json("hashes") Hashes []proto.Hash max 10000
+}
+
+// MissingOut lists the blocks a team lacks.
+type MissingOut struct {
+	@json("missing") Missing []str
+}
+
+// URLsOut maps each block to where it can be downloaded; Server lists the blocks that come through the server.
+type URLsOut struct {
+	@json("urls") Urls map[str]str
+	@json("expires_in") ExpiresIn i64
+}
+
+fn hashList(in HashesIn) ![]str {
+	mut out = []str{}
+	for h in in.Hashes {
+		let s str = h
+		if !proto.ValidHash(s) {
+			fail fault.Wrap(proto.ErrInvalid, "{s:q} is not a hex SHA-256")
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// Missing is which of the hashes the team lacks; a block marked lost counts as missing.
+fn Missing(c postgres.Client, team i64, in HashesIn) !MissingOut {
+	let hashes = try hashList(in)
+	mut missing = []str{}
+	if len(hashes) == 0 {
+		return MissingOut{Missing: missing}
+	}
+	let csv = twine.Join(hashes, ",")
+	let rows = try c.Query("SELECT hash FROM blocks WHERE team_id = {team} AND NOT lost AND hash = ANY(string_to_array({csv}, ','))")
+	mut have = map[str]bool{}
+	for r in rows.Rows {
+		have[r[0].Text()] = true
+	}
+	mut seen = map[str]bool{}
+	for h in hashes {
+		if !have[h] && !seen[h] {
+			missing = append(missing, h)
+			seen[h] = true
+		}
+	}
+	return MissingOut{Missing: missing}
+}
+
+// PutBlock stores one uploaded block after checking that its bytes hash to its name and fit the team's quota.
+fn PutBlock(c postgres.Client, s store.Store, team i64, hash str, data str) ! {
+	if !proto.ValidHash(hash) {
+		fail fault.Wrap(proto.ErrInvalid, "{hash:q} is not a hex SHA-256")
+	}
+	if len(data) > store.MaxBlock {
+		fail fault.Wrap(proto.ErrTooLarge, "a block has at most {store.MaxBlock} bytes, not {len(data)}")
+	}
+	let got = proto.BlockHash(data)
+	if got != hash {
+		fail fault.Wrap(proto.ErrBadBlock, "the bytes hash to {got}, not {hash}")
+	}
+	let have = try c.Query("SELECT lost FROM blocks WHERE team_id = {team} AND hash = {hash}")
+	if len(have.Rows) == 1 && have.Rows[0][0].Int() == 0 {
+		return
+	}
+	let size = len(data)
+	let t = try c.Query("SELECT used_bytes, quota_bytes FROM teams WHERE id = {team}")
+	if len(t.Rows) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "no team {team}")
+	}
+	let quota = t.Rows[0][1].Int()
+	if quota > 0 && t.Rows[0][0].Int() + size > quota {
+		fail fault.Wrap(proto.ErrQuota, "the team's quota of {quota} bytes is used up")
+	}
+	try s.Put(store.BlockKey(team, hash), data)
+	let rows = try c.Query("INSERT INTO blocks (team_id, hash, size) VALUES ({team}, {hash}, {size}) ON CONFLICT (team_id, hash) DO UPDATE SET lost = false RETURNING (xmax = 0)")
+	if len(rows.Rows) == 1 && rows.Rows[0][0].Int() != 0 {
+		_ = try c.Exec("UPDATE teams SET used_bytes = used_bytes + {size} WHERE id = {team}")
+	}
+}
+
+// GetBlock is a block of the team, read from the store.
+fn GetBlock(c postgres.Client, s store.Store, team i64, hash str) !str {
+	if !proto.ValidHash(hash) {
+		fail fault.Wrap(proto.ErrInvalid, "{hash:q} is not a hex SHA-256")
+	}
+	let rows = try c.Query("SELECT 1 FROM blocks WHERE team_id = {team} AND hash = {hash} AND NOT lost")
+	if len(rows.Rows) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "the team has no block {hash}")
+	}
+	return try s.Get(store.BlockKey(team, hash))
+}
+
+// URLs is where each of the team's blocks can be downloaded for expires seconds: a presigned URL from the bucket, or
+// this server's own path when downloads go through the server. Blocks the team lacks are left out.
+fn URLs(c postgres.Client, s store.Store, team i64, in HashesIn, viaServer bool, base str, expires i64) !URLsOut {
+	let hashes = try hashList(in)
+	mut urls = map[str]str{}
+	if len(hashes) == 0 {
+		return URLsOut{Urls: urls, ExpiresIn: expires}
+	}
+	let csv = twine.Join(hashes, ",")
+	let rows = try c.Query("SELECT hash FROM blocks WHERE team_id = {team} AND NOT lost AND hash = ANY(string_to_array({csv}, ','))")
+	for r in rows.Rows {
+		let h = r[0].Text()
+		if viaServer {
+			urls[h] = base + "/v1/teams/{team}/blocks/{h}"
+		} else {
+			urls[h] = try s.URL(store.BlockKey(team, h), expires)
+		}
+	}
+	return URLsOut{Urls: urls, ExpiresIn: expires}
+}
+
+// Sweep removes up to 500 of the team's blocks that no version uses and that are older than a day: each object
+// first, then its row, under the team's lock so no commit can start using one meanwhile. It returns how many it
+// removed.
+fn Sweep(c postgres.Client, s store.Store, team i64) !i64 {
+	mut tx = try c.Begin()
+	let (n, err) = sweepIn(mut tx, s, team)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+	return n
+}
+
+fn sweepIn(tx mut postgres.Tx, s store.Store, team i64) !i64 {
+	try lockTeam(mut tx, team)
+	let rows = try tx.Query("SELECT b.hash, b.size FROM blocks b WHERE b.team_id = {team} AND b.created_at < now() - interval '1 day' AND NOT EXISTS (SELECT 1 FROM version_blocks v WHERE v.team_id = b.team_id AND v.hash = b.hash) LIMIT 500")
+	mut freed = 0
+	mut n = 0
+	for r in rows.Rows {
+		let h = r[0].Text()
+		try s.Delete(store.BlockKey(team, h))
+		_ = try tx.Exec("DELETE FROM blocks WHERE team_id = {team} AND hash = {h}")
+		freed += r[1].Int()
+		n += 1
+	}
+	if freed > 0 {
+		_ = try tx.Exec("UPDATE teams SET used_bytes = greatest(used_bytes - {freed}, 0) WHERE id = {team}")
+	}
+	return n
+}
+
+// PurgeOut is what a purge removed.
+type PurgeOut struct {
+	Journal  i64
+	Versions i64
+	Trash    i64
+	Floor    i64
+}
+
+// Purge forgets what is older than days: journal rows (keeping each node's last one, so any seq from the new floor
+// on can be rewound to), versions no current node or kept row uses, and the trash.
+fn Purge(c postgres.Client, team i64, days i64) !PurgeOut {
+	mut tx = try c.Begin()
+	let (p, err) = purgeIn(mut tx, team, days)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+	return p
+}
+
+fn purgeIn(tx mut postgres.Tx, team i64, days i64) !PurgeOut {
+	try lockTeam(mut tx, team)
+	let t = try tx.Query("SELECT floor_seq FROM teams WHERE id = {team}")
+	let floor = t.Rows[0][0].Int()
+	let cutRows = try tx.Query("SELECT coalesce(max(seq), 0) FROM journal WHERE team_id = {team} AND at < now() - make_interval(days => {days}::int)")
+	let cut = cutRows.Rows[0][0].Int()
+	mut p = PurgeOut{Journal: 0, Versions: 0, Trash: 0, Floor: floor}
+	if cut <= floor {
+		return p
+	}
+	let j = try tx.Exec("DELETE FROM journal j WHERE j.team_id = {team} AND j.seq <= {cut} AND EXISTS (SELECT 1 FROM journal k WHERE k.team_id = j.team_id AND k.node_id = j.node_id AND k.seq > j.seq AND k.seq <= {cut})")
+	p.Journal = j.Affected
+	let gone = try tx.Exec("DELETE FROM nodes WHERE team_id = {team} AND deleted_seq IS NOT NULL AND deleted_seq > 0 AND deleted_seq <= {cut}")
+	p.Trash = gone.Affected
+	let v = try tx.Exec("DELETE FROM versions v WHERE v.team_id = {team} AND v.created_at < now() - make_interval(days => {days}::int) AND v.rev <> (SELECT n.rev FROM nodes n WHERE n.team_id = v.team_id AND n.id = v.node_id) AND NOT EXISTS (SELECT 1 FROM journal k WHERE k.team_id = v.team_id AND k.node_id = v.node_id AND k.rev = v.rev)")
+	p.Versions = v.Affected
+	_ = try tx.Exec("UPDATE teams SET floor_seq = {cut} WHERE id = {team}")
+	p.Floor = cut
+	return p
+}
+
+// CheckOut is what a check found.
+type CheckOut struct {
+	Blocks   i64
+	Lost     i64
+	Orphans  i64
+	BadDirs  i64
+}
+
+// Check looks at every block row of the team: its object must exist (and, when deep, hash to its name); a bad one is
+// marked lost, so the next Mac that has it uploads it again. It also counts objects with no row, and recomputes every
+// folder's hash.
+fn Check(c postgres.Client, s store.Store, team i64, deep bool) !CheckOut {
+	let rows = try c.Query("SELECT hash FROM blocks WHERE team_id = {team} AND NOT lost ORDER BY hash")
+	mut o = CheckOut{Blocks: len(rows.Rows), Lost: 0, Orphans: 0, BadDirs: 0}
+	mut known = map[str]bool{}
+	for r in rows.Rows {
+		let h = r[0].Text()
+		known[store.BlockKey(team, h)] = true
+		mut ok = false
+		if deep {
+			let data = s.Get(store.BlockKey(team, h)) catch _ {
+				""
+			}
+			ok = len(data) > 0 && proto.BlockHash(data) == h
+		} else {
+			ok = try s.Exists(store.BlockKey(team, h))
+		}
+		if !ok {
+			_ = try c.Exec("UPDATE blocks SET lost = true WHERE team_id = {team} AND hash = {h}")
+			o.Lost += 1
+		}
+	}
+	let objs = try s.List(store.TeamPrefix(team))
+	for obj in objs {
+		if !known[obj.Key] {
+			let h = obj.Key[len(store.TeamPrefix(team)):]
+			let row = try c.Query("SELECT 1 FROM blocks WHERE team_id = {team} AND hash = {h}")
+			if len(row.Rows) == 0 {
+				o.Orphans += 1
+			}
+		}
+	}
+	o.BadDirs = try RehashAll(c, team)
+	return o
+}

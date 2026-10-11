@@ -1,0 +1,271 @@
+package tree
+
+import "../../proto"
+import "fault"
+import "postgres"
+import "twine"
+
+// A team's folder as rows (design/backend.md, "The folder as a tree"): nodes are parent-pointer rows, every change
+// takes the team's next seq and appends the node's new state to the journal, and every directory keeps the Merkle
+// hash of its live children. Every change runs under the team's advisory lock, so a team's changes never interleave.
+
+// lockBase plus a team id is that team's advisory lock.
+const lockBase = 86130000000
+
+// Node is one row of nodes; Parent is 0 for the root and DeletedSeq 0 while the node is live.
+type Node struct {
+	Id         i64
+	Parent     i64
+	Name       str
+	Kind       i64
+	Hash       str
+	Size       i64
+	MtimeNs    i64
+	Rev        i64
+	PlaceRev   i64
+	DeletedSeq i64
+}
+
+fn rollback(tx mut postgres.Tx) {
+	tx.Rollback() catch _ {
+	}
+}
+
+// lockTeam takes the team's lock for the rest of the transaction.
+fn lockTeam(tx mut postgres.Tx, team i64) ! {
+	let key = lockBase + team
+	_ = try tx.Query("SELECT pg_advisory_xact_lock({key})")
+}
+
+fn scan(r []postgres.Value) Node {
+	return Node{Id: r[0].Int(), Parent: r[1].Int(), Name: r[2].Text(), Kind: r[3].Int(), Hash: r[4].Text(), Size: r[5].Int(), MtimeNs: r[6].Int(), Rev: r[7].Int(), PlaceRev: r[8].Int(), DeletedSeq: r[9].Int()}
+}
+
+// splitBlocks reads a comma-separated block list.
+fn splitBlocks(s str) []str {
+	if len(s) == 0 {
+		return []str{}
+	}
+	return twine.Split(s, ",")
+}
+
+fn out(n Node, blocks []str) proto.NodeOut {
+	return proto.NodeOut{Id: n.Id, Parent: n.Parent, Name: n.Name, Kind: n.Kind, Hash: n.Hash, Size: n.Size, MtimeNs: n.MtimeNs, Rev: n.Rev, PlaceRev: n.PlaceRev, DeletedSeq: n.DeletedSeq, Blocks: blocks}
+}
+
+// loadIn is a node of the team, live or not, nil when there is none.
+fn loadIn(tx mut postgres.Tx, team i64, id i64) !?Node {
+	let rows = try tx.Query("SELECT id, coalesce(parent_id, 0), name, kind, hash, size, mtime_ns, rev, place_rev, coalesce(deleted_seq, 0) FROM nodes WHERE team_id = {team} AND id = {id}")
+	if len(rows.Rows) == 0 {
+		return nil
+	}
+	return scan(rows.Rows[0])
+}
+
+// blocksOf is the block list of a file's version.
+fn blocksOf(tx mut postgres.Tx, team i64, id i64, rev i64) ![]str {
+	let rows = try tx.Query("SELECT coalesce(string_agg(hash, ',' ORDER BY idx), '') FROM version_blocks WHERE team_id = {team} AND node_id = {id} AND rev = {rev}")
+	return splitBlocks(rows.Rows[0][0].Text())
+}
+
+fn current(tx mut postgres.Tx, team i64, n Node) !proto.NodeOut {
+	mut blocks = []str{}
+	if n.Kind != proto.KindDir {
+		blocks = try blocksOf(mut tx, team, n.Id, n.Rev)
+	}
+	return out(n, blocks)
+}
+
+// Head is a team folder's head: its seq, epoch, root and root hash.
+fn Head(c postgres.Client, team i64) !proto.HeadOut {
+	let rows = try c.Query("SELECT head_seq, epoch, root_id, root_hash, floor_seq FROM teams WHERE id = {team}")
+	if len(rows.Rows) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "no team {team}")
+	}
+	let r = rows.Rows[0]
+	return proto.HeadOut{Seq: r[0].Int(), Epoch: r[1].Text(), Root: r[2].Int(), RootHash: r[3].Text(), Floor: r[4].Int()}
+}
+
+// Delta is up to pageSize journal rows after cursor; a cursor below the journal's floor (or past its head) is a reset.
+fn Delta(c postgres.Client, team i64, cursor i64, pageSize i64) !proto.DeltaOut {
+	let h = try Head(c, team)
+	if cursor < h.Floor || cursor > h.Seq {
+		return proto.DeltaOut{Entries: []proto.Entry{}, Cursor: h.Seq, More: false, Reset: true, Epoch: h.Epoch, Head: h.Seq}
+	}
+	let n = pageSize + 1
+	let rows = try c.Query("SELECT j.seq, j.op, j.node_id, coalesce(j.parent_id, 0), j.name, j.kind, j.hash, j.size, j.mtime_ns, j.rev, j.place_rev, j.deleted, coalesce(j.device_id, 0), CASE WHEN j.kind <> 1 AND NOT j.deleted THEN (SELECT coalesce(string_agg(vb.hash, ',' ORDER BY vb.idx), '') FROM version_blocks vb WHERE vb.team_id = j.team_id AND vb.node_id = j.node_id AND vb.rev = j.rev) ELSE '' END FROM journal j WHERE j.team_id = {team} AND j.seq > {cursor} ORDER BY j.seq LIMIT {n}")
+	mut entries = []proto.Entry{}
+	mut last = cursor
+	mut more = false
+	for i, r in rows.Rows {
+		if i == pageSize {
+			more = true
+			break
+		}
+		entries = append(entries, proto.Entry{Seq: r[0].Int(), Op: r[1].Text(), Node: r[2].Int(), Parent: r[3].Int(), Name: r[4].Text(), Kind: r[5].Int(), Hash: r[6].Text(), Size: r[7].Int(), MtimeNs: r[8].Int(), Rev: r[9].Int(), PlaceRev: r[10].Int(), Deleted: r[11].Int() != 0, Device: r[12].Int(), Blocks: splitBlocks(r[13].Text())})
+		last = r[0].Int()
+	}
+	if !more {
+		last = max(last, h.Seq)
+	}
+	return proto.DeltaOut{Entries: entries, Cursor: last, More: more, Reset: false, Epoch: h.Epoch, Head: h.Seq}
+}
+
+fn nodeRows(rows postgres.Rows) []proto.NodeOut {
+	mut nodes = []proto.NodeOut{}
+	for r in rows.Rows {
+		nodes = append(nodes, out(scan(r), splitBlocks(r[10].Text())))
+	}
+	return nodes
+}
+
+// Snapshot is up to pageSize live nodes with an id above after, in id order, with the seq to apply the delta from.
+fn Snapshot(c postgres.Client, team i64, after i64, pageSize i64) !proto.SnapshotOut {
+	let h = try Head(c, team)
+	let n = pageSize + 1
+	let rows = try c.Query("SELECT n.id, coalesce(n.parent_id, 0), n.name, n.kind, n.hash, n.size, n.mtime_ns, n.rev, n.place_rev, 0, CASE WHEN n.kind <> 1 THEN (SELECT coalesce(string_agg(vb.hash, ',' ORDER BY vb.idx), '') FROM version_blocks vb WHERE vb.team_id = n.team_id AND vb.node_id = n.id AND vb.rev = n.rev) ELSE '' END FROM nodes n WHERE n.team_id = {team} AND n.deleted_seq IS NULL AND n.id > {after} ORDER BY n.id LIMIT {n}")
+	mut nodes = nodeRows(rows)
+	mut more = false
+	mut next = after
+	if len(nodes) > pageSize {
+		more = true
+		nodes = nodes[0:pageSize]
+	}
+	if len(nodes) > 0 {
+		next = nodes[len(nodes) - 1].Id
+	}
+	return proto.SnapshotOut{Nodes: nodes, Next: next, More: more, Seq: h.Seq}
+}
+
+// Get is one node of the team, live or in the trash.
+fn Get(c postgres.Client, team i64, id i64) !proto.NodeOut {
+	let rows = try c.Query("SELECT n.id, coalesce(n.parent_id, 0), n.name, n.kind, n.hash, n.size, n.mtime_ns, n.rev, n.place_rev, coalesce(n.deleted_seq, 0), CASE WHEN n.kind <> 1 THEN (SELECT coalesce(string_agg(vb.hash, ',' ORDER BY vb.idx), '') FROM version_blocks vb WHERE vb.team_id = n.team_id AND vb.node_id = n.id AND vb.rev = n.rev) ELSE '' END FROM nodes n WHERE n.team_id = {team} AND n.id = {id}")
+	let nodes = nodeRows(rows)
+	if len(nodes) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "no node {id}")
+	}
+	return nodes[0]
+}
+
+// Children is a live directory's live children, by name.
+fn Children(c postgres.Client, team i64, id i64) ![]proto.NodeOut {
+	let dir = try Get(c, team, id)
+	if dir.Kind != proto.KindDir || dir.DeletedSeq != 0 {
+		fail fault.Wrap(proto.ErrNotFound, "no folder {id}")
+	}
+	let rows = try c.Query("SELECT n.id, coalesce(n.parent_id, 0), n.name, n.kind, n.hash, n.size, n.mtime_ns, n.rev, n.place_rev, 0, CASE WHEN n.kind <> 1 THEN (SELECT coalesce(string_agg(vb.hash, ',' ORDER BY vb.idx), '') FROM version_blocks vb WHERE vb.team_id = n.team_id AND vb.node_id = n.id AND vb.rev = n.rev) ELSE '' END FROM nodes n WHERE n.team_id = {team} AND n.parent_id = {id} AND n.deleted_seq IS NULL ORDER BY n.name COLLATE \"C\"")
+	return nodeRows(rows)
+}
+
+// depthOf is how many steps a node is below the root.
+fn depthOf(tx mut postgres.Tx, team i64, id i64) !i64 {
+	let rows = try tx.Query("WITH RECURSIVE up(id, parent_id, depth) AS (SELECT id, parent_id, 0 FROM nodes WHERE team_id = {team} AND id = {id} UNION ALL SELECT n.id, n.parent_id, up.depth + 1 FROM nodes n JOIN up ON n.id = up.parent_id WHERE n.team_id = {team}) SELECT coalesce(max(depth), 0) FROM up")
+	return rows.Rows[0][0].Int()
+}
+
+// isWithin reports whether id is anc or below it.
+fn isWithin(tx mut postgres.Tx, team i64, anc i64, id i64) !bool {
+	let rows = try tx.Query("WITH RECURSIVE up(id, parent_id) AS (SELECT id, parent_id FROM nodes WHERE team_id = {team} AND id = {id} UNION ALL SELECT n.id, n.parent_id FROM nodes n JOIN up ON n.id = up.parent_id WHERE n.team_id = {team}) SELECT count(*) FROM up WHERE id = {anc}")
+	return rows.Rows[0][0].Int() > 0
+}
+
+// dirHashIn is a directory's hash computed from its live children's rows.
+fn dirHashIn(tx mut postgres.Tx, team i64, id i64) !str {
+	let rows = try tx.Query("SELECT name, kind, hash FROM nodes WHERE team_id = {team} AND parent_id = {id} AND deleted_seq IS NULL")
+	mut kids = []proto.Child{}
+	for r in rows.Rows {
+		kids = append(kids, proto.Child{Name: r[0].Text(), Kind: r[1].Int(), Hash: r[2].Text()})
+	}
+	return try proto.DirHash(kids)
+}
+
+// rehash recomputes the hash of every directory in dirty and of their ancestors, deepest first, and stores the
+// root's hash on the team. It returns the root hash.
+fn rehash(tx mut postgres.Tx, team i64, dirty map[i64]bool) !str {
+	mut depth = map[i64]i64{}
+	for id, _ in dirty {
+		if id > 0 {
+			depth[id] = try depthOf(mut tx, team, id)
+		}
+	}
+	for len(depth) > 0 {
+		mut pick = 0
+		mut deepest = -1
+		for id, d in depth {
+			if d > deepest {
+				deepest = d
+				pick = id
+			}
+		}
+		delete(depth, pick)
+		let got = try loadIn(mut tx, team, pick)
+		if got == nil {
+			continue
+		}
+		let n = got
+		if n.Kind != proto.KindDir || n.DeletedSeq != 0 {
+			continue
+		}
+		let h = try dirHashIn(mut tx, team, pick)
+		if h != n.Hash {
+			_ = try tx.Exec("UPDATE nodes SET hash = {h} WHERE team_id = {team} AND id = {pick}")
+			if n.Parent > 0 {
+				let (_, queued) = depth[n.Parent]
+				if !queued {
+					depth[n.Parent] = deepest - 1
+				}
+			}
+		}
+	}
+	let rows = try tx.Query("SELECT n.hash FROM teams t JOIN nodes n ON n.team_id = t.id AND n.id = t.root_id WHERE t.id = {team}")
+	let root = rows.Rows[0][0].Text()
+	_ = try tx.Exec("UPDATE teams SET root_hash = {root} WHERE id = {team}")
+	return root
+}
+
+// RehashAll recomputes every live directory's hash from its children and returns how many were wrong.
+fn RehashAll(c postgres.Client, team i64) !i64 {
+	mut tx = try c.Begin()
+	let (n, err) = rehashAllIn(mut tx, team)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+	return n
+}
+
+fn rehashAllIn(tx mut postgres.Tx, team i64) !i64 {
+	try lockTeam(mut tx, team)
+	let rows = try tx.Query("WITH RECURSIVE down(id, depth) AS (SELECT root_id, 0 FROM teams WHERE id = {team} UNION ALL SELECT n.id, down.depth + 1 FROM nodes n JOIN down ON n.parent_id = down.id WHERE n.team_id = {team} AND n.kind = 1 AND n.deleted_seq IS NULL) SELECT d.id, n.hash FROM down d JOIN nodes n ON n.team_id = {team} AND n.id = d.id ORDER BY d.depth DESC")
+	mut wrong = 0
+	for r in rows.Rows {
+		let id = r[0].Int()
+		let h = try dirHashIn(mut tx, team, id)
+		if h != r[1].Text() {
+			wrong += 1
+			_ = try tx.Exec("UPDATE nodes SET hash = {h} WHERE team_id = {team} AND id = {id}")
+		}
+	}
+	let root = try tx.Query("SELECT n.hash FROM teams t JOIN nodes n ON n.team_id = t.id AND n.id = t.root_id WHERE t.id = {team}")
+	let rh = root.Rows[0][0].Text()
+	_ = try tx.Exec("UPDATE teams SET root_hash = {rh} WHERE id = {team}")
+	return wrong
+}
+
+// Teams is the id of every team, for the background jobs.
+fn Teams(c postgres.Client) ![]i64 {
+	let rows = try c.Query("SELECT id FROM teams ORDER BY id")
+	mut ids = []i64{}
+	for r in rows.Rows {
+		ids = append(ids, r[0].Int())
+	}
+	return ids
+}
+
+// NewEpochs gives every team a new epoch, after Postgres was restored from a backup: clients then stop trusting
+// their merge base and merge without deleting.
+fn NewEpochs(c postgres.Client) !i64 {
+	let r = try c.Exec("UPDATE teams SET epoch = md5(random()::text || clock_timestamp()::text || id::text)")
+	return r.Affected
+}

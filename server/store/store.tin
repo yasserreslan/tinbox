@@ -1,0 +1,207 @@
+package store
+
+import "../../proto"
+import "fault"
+import "quarry"
+import "s3"
+import "seal"
+import "tide"
+import "twine"
+
+// Where block bytes live: an S3-compatible bucket (Cloudflare R2 in production), or a local directory for
+// development. A block's key is teams/<team id>/blocks/<sha256>, so equal content in two teams is two objects
+// (design/backend.md, decision 5).
+
+// MaxBlock is the most bytes a stored block may have.
+const MaxBlock = 4194304
+
+// Options say which store and how to reach it.
+type Options struct {
+	Kind      str
+	Dir       str
+	Endpoint  str
+	Region    str
+	Bucket    str
+	AccessKey str
+	SecretKey secret str
+	PathStyle bool
+}
+
+// Store is an open block store. Err is why an S3 store could not be made ("" when it can be used).
+type Store struct {
+	Kind   str
+	Dir    str
+	Bucket str
+	Err    str
+	client ?s3.Client
+}
+
+// Object is one stored object: its key and size.
+type Object struct {
+	Key  str
+	Size i64
+}
+
+// Open makes the store o names; an S3 store that cannot be made keeps the reason in Err.
+fn Open(o Options) Store {
+	if o.Kind == "dir" {
+		return Store{Kind: "dir", Dir: twine.TrimRight(o.Dir, "/"), Bucket: "", Err: "", client: nil}
+	}
+	let c = s3.New(s3.Config{Endpoint: o.Endpoint, Region: o.Region, AccessKey: o.AccessKey, SecretKey: o.SecretKey, Token: "", PathStyle: o.PathStyle, SignPayload: false, UnsignedPayload: false, Attempts: 0, Backoff: 0, Timeout: 0, TLS: nil}) catch err {
+		return Store{Kind: "s3", Dir: "", Bucket: o.Bucket, Err: fault.Message(err), client: nil}
+	}
+	return Store{Kind: "s3", Dir: "", Bucket: o.Bucket, Err: "", client: c}
+}
+
+// BlockKey is the key of a team's block.
+fn BlockKey(team i64, hash str) str {
+	return "teams/{team}/blocks/{hash}"
+}
+
+// TeamPrefix is the prefix every block key of a team starts with.
+fn TeamPrefix(team i64) str {
+	return "teams/{team}/blocks/"
+}
+
+fn (s Store) s3c() !s3.Client {
+	let c = s.client
+	if c == nil {
+		fail "block store: {s.Err}"
+	}
+	return c
+}
+
+fn (s Store) path(key str) str {
+	return s.Dir + "/" + key
+}
+
+fn parent(path str) str {
+	let i = twine.LastIndex(path, "/")
+	if i <= 0 {
+		return "."
+	}
+	return path[0:i]
+}
+
+// Put stores data under key, replacing what was there; a directory store writes a temporary file of its own and
+// renames it, so two uploads of one block never mix.
+fn (s Store) Put(key str, data str) ! {
+	if s.Kind == "dir" {
+		let p = s.path(key)
+		try quarry.MkdirAll(parent(p))
+		let tmp = p + "." + seal.Hex(seal.RandomBytes(8)) + ".tmp"
+		try quarry.WriteFile(tmp, data)
+		try quarry.Rename(tmp, p)
+		return
+	}
+	let c = try s.s3c()
+	_ = try c.PutBytes(s.Bucket, key, data)
+}
+
+// Get is the object at key; a missing one fails with proto.ErrNotFound.
+fn (s Store) Get(key str) !str {
+	if s.Kind == "dir" {
+		let p = s.path(key)
+		if !quarry.Exists(p) {
+			fail fault.Wrap(proto.ErrNotFound, "no object {key}")
+		}
+		return try quarry.ReadFileBound(p, MaxBlock + 1)
+	}
+	let c = try s.s3c()
+	let data = c.GetBytes(s.Bucket, key, MaxBlock + 1) catch err {
+		if fault.Is(err, s3.ErrNotFound) {
+			fail fault.Wrap(proto.ErrNotFound, "no object {key}")
+		}
+		fail err
+	}
+	return data
+}
+
+// Exists reports whether key holds an object.
+fn (s Store) Exists(key str) !bool {
+	if s.Kind == "dir" {
+		return quarry.Exists(s.path(key))
+	}
+	let c = try s.s3c()
+	_ = c.Head(s.Bucket, key) catch err {
+		if fault.Is(err, s3.ErrNotFound) {
+			return false
+		}
+		fail err
+	}
+	return true
+}
+
+// Delete removes the object at key; a missing one is no fault.
+fn (s Store) Delete(key str) ! {
+	if s.Kind == "dir" {
+		let p = s.path(key)
+		if quarry.Exists(p) {
+			try quarry.Remove(p)
+		}
+		return
+	}
+	let c = try s.s3c()
+	c.Delete(s.Bucket, key) catch err {
+		if fault.Is(err, s3.ErrNotFound) {
+			return
+		}
+		fail err
+	}
+}
+
+// List is every object whose key starts with prefix, which ends in "/".
+fn (s Store) List(prefix str) ![]Object {
+	mut out = []Object{}
+	if s.Kind == "dir" {
+		let dir = twine.TrimRight(s.path(prefix), "/")
+		if !quarry.IsDir(dir) {
+			return out
+		}
+		let names = try quarry.ReadDir(dir)
+		for name in names {
+			if twine.HasSuffix(name, ".tmp") {
+				continue
+			}
+			let info = try quarry.Stat(dir + "/" + name)
+			out = append(out, Object{Key: prefix + name, Size: info.Size})
+		}
+		return out
+	}
+	let c = try s.s3c()
+	let objs = try c.ListAll(s.Bucket, prefix)
+	for o in objs {
+		out = append(out, Object{Key: o.Key, Size: o.Size})
+	}
+	return out
+}
+
+// URL is a presigned GET for key that lasts expires seconds, or "" for a directory store (blocks then come through
+// the server).
+fn (s Store) URL(key str, expires i64) !str {
+	if s.Kind == "dir" {
+		return ""
+	}
+	let c = try s.s3c()
+	return try c.Presign("GET", s.Bucket, key, expires * tide.Second)
+}
+
+// Probe writes, reads and removes a small object, so a server with the wrong keys or bucket stops at start. A bucket
+// that does not exist yet is made, when the keys may make one.
+fn (s Store) Probe() ! {
+	let key = "health/probe"
+	let first = s.Put(key, "tinbox")
+	if first != nil {
+		if s.Kind != "s3" || s3.ErrorCode(first) != "NoSuchBucket" {
+			fail fault.Wrap(first, "writing {key}")
+		}
+		let c = try s.s3c()
+		try c.CreateBucket(s.Bucket) wrap "the bucket {s.Bucket} does not exist, and making it failed"
+		try s.Put(key, "tinbox") wrap "writing {key}"
+	}
+	let back = try s.Get(key) wrap "reading {key}"
+	if back != "tinbox" {
+		fail "block store: {key} read back {len(back)} bytes"
+	}
+	try s.Delete(key) wrap "removing {key}"
+}

@@ -1,0 +1,343 @@
+package config
+
+import "fault"
+import "link"
+import "mint"
+import "quarry"
+import "twine"
+
+// tinbox's configuration (design/backend.md, "Configuration"): an optional file of key = value lines, each key
+// overridable by the environment (TINBOX_ and the key in upper case, dots as underscores), and a value file:PATH read
+// from that file. DATABASE_URL, which Aiven Runtime sets for a connected database, fills db.url when nothing else does,
+// and PORT, when a platform sets it, fills listen.
+
+// ErrConfig is the fault of a configuration that cannot be used.
+let ErrConfig = fault("tinbox config")
+
+// Config is every setting tinbox reads.
+type Config struct {
+	Listen      str
+	PublicURL   str
+	TLSCert     str
+	TLSKey      str
+	DbAddr      str
+	DbUser      str
+	DbPassword  secret str
+	DbName      str
+	DbSSLMode   str
+	DbMaxTotal  i64
+	Store       str
+	StoreDir    str
+	S3Endpoint  str
+	S3Region    str
+	S3Bucket    str
+	S3AccessKey str
+	S3SecretKey secret str
+	S3PathStyle bool
+	Downloads   str
+	NonceSecret secret str
+	HistoryDays i64
+	Migrate     bool
+	Jobs        bool
+	LogLevel    str
+}
+
+// Key is one setting: its name, its default and whether it is a secret.
+type Key struct {
+	Name    str
+	Default str
+	Secret  bool
+}
+
+// Keys is every key a configuration may set.
+fn Keys() []Key {
+	return []Key{
+		Key{Name: "listen", Default: ":8080", Secret: false},
+		Key{Name: "public_url", Default: "", Secret: false},
+		Key{Name: "tls.cert", Default: "", Secret: false},
+		Key{Name: "tls.key", Default: "", Secret: false},
+		Key{Name: "db.url", Default: "", Secret: true},
+		Key{Name: "db.addr", Default: "127.0.0.1:5432", Secret: false},
+		Key{Name: "db.user", Default: "tinbox", Secret: false},
+		Key{Name: "db.password", Default: "", Secret: true},
+		Key{Name: "db.name", Default: "tinbox", Secret: false},
+		Key{Name: "db.sslmode", Default: "", Secret: false},
+		Key{Name: "db.max_total", Default: "10", Secret: false},
+		Key{Name: "store", Default: "s3", Secret: false},
+		Key{Name: "store.dir", Default: "./data/blocks", Secret: false},
+		Key{Name: "s3.endpoint", Default: "", Secret: false},
+		Key{Name: "s3.region", Default: "auto", Secret: false},
+		Key{Name: "s3.bucket", Default: "tinbox", Secret: false},
+		Key{Name: "s3.access_key", Default: "", Secret: false},
+		Key{Name: "s3.secret_key", Default: "", Secret: true},
+		Key{Name: "s3.path_style", Default: "true", Secret: false},
+		Key{Name: "downloads", Default: "", Secret: false},
+		Key{Name: "secrets.nonce", Default: "", Secret: true},
+		Key{Name: "history.days", Default: "30", Secret: false},
+		Key{Name: "migrate", Default: "true", Secret: false},
+		Key{Name: "jobs", Default: "true", Secret: false},
+		Key{Name: "log.level", Default: "info", Secret: false},
+	}
+}
+
+// EnvName is the environment variable that sets key: TINBOX_ and the key in upper case, dots as underscores.
+fn EnvName(key str) str {
+	return "TINBOX_" + twine.ToUpper(twine.ReplaceAll(key, ".", "_"))
+}
+
+fn known(key str) bool {
+	for k in Keys() {
+		if k.Name == key {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseText reads the key = value lines of a configuration file; an unknown key or a line without "=" is a fault
+// naming its line.
+fn ParseText(text str) !map[str]str {
+	mut out = map[str]str{}
+	mut n = 0
+	for line in twine.Split(text, "\n") {
+		n += 1
+		let t = twine.TrimSpace(line)
+		if len(t) == 0 || t[0] == '#' {
+			continue
+		}
+		let (k, v, ok) = twine.Cut(t, "=")
+		if !ok {
+			fail fault.Wrap(ErrConfig, "line {n}: want key = value")
+		}
+		let key = twine.TrimSpace(k)
+		if !known(key) {
+			fail fault.Wrap(ErrConfig, "line {n}: unknown key {key}")
+		}
+		mut val = twine.TrimSpace(v)
+		if len(val) >= 2 && val[0] == '"' && val[len(val) - 1] == '"' {
+			val = val[1:len(val) - 1]
+		}
+		out[key] = val
+	}
+	return out
+}
+
+// Resolve is the value of every key: the file's value, else the default, then the environment's when set, and a
+// file:PATH value replaced by that file's text without its trailing newline.
+fn Resolve(file map[str]str, env fn(str) (str, bool)) !map[str]str {
+	mut out = map[str]str{}
+	for k in Keys() {
+		mut v = k.Default
+		let (fv, inFile) = file[k.Name]
+		if inFile {
+			v = fv
+		}
+		let (ev, inEnv) = env(EnvName(k.Name))
+		if inEnv {
+			v = ev
+		}
+		if k.Name == "listen" && !inFile && !inEnv {
+			let (port, inPort) = env("PORT")
+			if inPort && len(port) > 0 {
+				v = ":" + port
+			}
+		}
+		if k.Name == "db.url" && len(v) == 0 {
+			let (dv, inDb) = env("DATABASE_URL")
+			if inDb {
+				v = dv
+			}
+		}
+		if twine.HasPrefix(v, "file:") {
+			let path = v[5:]
+			let text = quarry.ReadFileBound(path, 1024 * 1024) catch err {
+				fail fault.Wrap(ErrConfig, "{k.Name}: reading {path}: {fault.Message(err)}")
+			}
+			v = twine.TrimRight(text, "\r\n")
+		}
+		out[k.Name] = v
+	}
+	return out
+}
+
+fn count(vals map[str]str, key str) !i64 {
+	let n = mint.Atoi(vals[key]) catch _ {
+		fail fault.Wrap(ErrConfig, "{key}: {vals[key]} is not a number")
+		0
+	}
+	if n < 0 {
+		fail fault.Wrap(ErrConfig, "{key}: cannot be negative")
+	}
+	return n
+}
+
+fn flag(vals map[str]str, key str) !bool {
+	let b = mint.ParseBool(vals[key]) catch _ {
+		fail fault.Wrap(ErrConfig, "{key}: {vals[key]} is not true or false")
+		false
+	}
+	return b
+}
+
+// DbTarget is where a postgres:// URL points.
+type DbTarget struct {
+	Addr     str
+	User     str
+	Password secret str
+	Name     str
+	SSLMode  str
+}
+
+// ParseDbURL reads postgres://user:password@host:port/name?sslmode=MODE.
+fn ParseDbURL(raw secret str) !DbTarget {
+	let u = link.Parse(reveal(raw)) catch _ {
+		fail fault.Wrap(ErrConfig, "db.url is not a URL")
+	}
+	if u.Scheme != "postgres" && u.Scheme != "postgresql" {
+		fail fault.Wrap(ErrConfig, "db.url: want postgres://user:password@host:port/name")
+	}
+	mut port = u.Port()
+	if len(port) == 0 {
+		port = "5432"
+	}
+	let host = u.Hostname()
+	if len(host) == 0 {
+		fail fault.Wrap(ErrConfig, "db.url has no host")
+	}
+	let (pw, _) = u.Password()
+	mut name = twine.TrimPrefix(u.Path, "/")
+	if len(name) == 0 {
+		name = u.Username()
+	}
+	mut mode = u.Query().Get("sslmode")
+	if mode == "prefer" || mode == "allow" {
+		mode = "require"
+	}
+	if mode != "" && mode != "disable" && mode != "require" && mode != "verify-full" && mode != "verify-ca" {
+		fail fault.Wrap(ErrConfig, "db.url: sslmode {mode} is not disable, require or verify-full")
+	}
+	if mode == "verify-ca" {
+		mode = "verify-full"
+	}
+	return DbTarget{Addr: host + ":" + port, User: u.Username(), Password: pw, Name: name, SSLMode: mode}
+}
+
+// Build makes a Config from resolved values and checks it.
+fn Build(vals map[str]str) !Config {
+	return try BuildFor(vals, true)
+}
+
+// BuildFor is Build for a command that may not use the block store (needStore false): its settings are then not
+// required, so `tinbox migrate` and `tinbox admin` need only the database.
+fn BuildFor(vals map[str]str, needStore bool) !Config {
+	mut db = DbTarget{Addr: vals["db.addr"], User: vals["db.user"], Password: vals["db.password"], Name: vals["db.name"], SSLMode: vals["db.sslmode"]}
+	if len(vals["db.url"]) > 0 {
+		db = try ParseDbURL(vals["db.url"])
+	}
+	let store = vals["store"]
+	if store != "s3" && store != "dir" {
+		fail fault.Wrap(ErrConfig, "store: {store} is not s3 or dir")
+	}
+	if store == "s3" && needStore {
+		for k in []str{"s3.endpoint", "s3.bucket", "s3.access_key", "s3.secret_key"} {
+			if len(vals[k]) == 0 {
+				fail fault.Wrap(ErrConfig, "store = s3 (the default) needs {k} ({EnvName(k)}): an S3-compatible bucket such as Cloudflare R2 (s3.endpoint = https://ACCOUNT_ID.r2.cloudflarestorage.com); store = dir keeps blocks on local disk, for development")
+			}
+		}
+	}
+	mut downloads = vals["downloads"]
+	if len(downloads) == 0 {
+		downloads = match store {
+			"s3" => "presigned"
+			_ => "server"
+		}
+	}
+	if downloads != "presigned" && downloads != "server" {
+		fail fault.Wrap(ErrConfig, "downloads: {downloads} is not presigned or server")
+	}
+	if downloads == "presigned" && store != "s3" {
+		fail fault.Wrap(ErrConfig, "downloads = presigned needs store = s3")
+	}
+	if (len(vals["tls.cert"]) == 0) != (len(vals["tls.key"]) == 0) {
+		fail fault.Wrap(ErrConfig, "tls.cert and tls.key go together")
+	}
+	let level = vals["log.level"]
+	if level != "debug" && level != "info" && level != "warn" && level != "error" {
+		fail fault.Wrap(ErrConfig, "log.level: {level} is not debug, info, warn or error")
+	}
+	let history = try count(vals, "history.days")
+	if history < 1 {
+		fail fault.Wrap(ErrConfig, "history.days: at least 1")
+	}
+	let maxTotal = try count(vals, "db.max_total")
+	let pathStyle = try flag(vals, "s3.path_style")
+	let migrate = try flag(vals, "migrate")
+	let jobs = try flag(vals, "jobs")
+	return Config{
+		Listen: vals["listen"],
+		PublicURL: twine.TrimRight(vals["public_url"], "/"),
+		TLSCert: vals["tls.cert"],
+		TLSKey: vals["tls.key"],
+		DbAddr: db.Addr,
+		DbUser: db.User,
+		DbPassword: db.Password,
+		DbName: db.Name,
+		DbSSLMode: db.SSLMode,
+		DbMaxTotal: maxTotal,
+		Store: store,
+		StoreDir: vals["store.dir"],
+		S3Endpoint: vals["s3.endpoint"],
+		S3Region: vals["s3.region"],
+		S3Bucket: vals["s3.bucket"],
+		S3AccessKey: vals["s3.access_key"],
+		S3SecretKey: vals["s3.secret_key"],
+		S3PathStyle: pathStyle,
+		Downloads: downloads,
+		NonceSecret: vals["secrets.nonce"],
+		HistoryDays: history,
+		Migrate: migrate,
+		Jobs: jobs,
+		LogLevel: level,
+	}
+}
+
+fn env(name str) (str, bool) {
+	return quarry.LookupEnv(name)
+}
+
+// Path is the configuration file: the --config flag's, else $TINBOX_CONFIG, else "" for none.
+fn Path(flagPath str) str {
+	if len(flagPath) > 0 {
+		return flagPath
+	}
+	return quarry.Getenv("TINBOX_CONFIG")
+}
+
+// Load reads the file at path ("" for none), applies the environment, and builds the Config.
+fn Load(path str) !Config {
+	return try LoadFor(path, true)
+}
+
+// LoadFor is Load for a command that may not use the block store.
+fn LoadFor(path str, needStore bool) !Config {
+	mut file = map[str]str{}
+	if len(path) > 0 {
+		let text = try quarry.ReadFileBound(path, 1024 * 1024) wrap "reading {path}"
+		file = try ParseText(text) wrap "{path}"
+	}
+	let vals = try Resolve(file, env)
+	return try BuildFor(vals, needStore)
+}
+
+// Defaults is the configuration with no file and no environment, for commands that read none.
+fn Defaults() Config {
+	mut vals = map[str]str{}
+	for k in Keys() {
+		vals[k.Name] = k.Default
+	}
+	vals["store"] = "dir"
+	let c = Build(vals) catch _ {
+		panic("tinbox: the default configuration does not build")
+	}
+	return c
+}

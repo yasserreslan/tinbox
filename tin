@@ -1,0 +1,18 @@
+#!/bin/sh
+# Runs the Tin release named in TIN_VERSION, installing it first if this machine lacks it.
+# Releases go to ${XDG_CACHE_HOME:-~/.cache}/tinbox/tin (TINBOX_TIN_DIR overrides), so the tin on
+# your PATH and any Tin checkout are never touched.
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+version=$(tr -d ' \r\n' < "$here/TIN_VERSION")
+case $(uname -s) in Darwin) os=darwin ;; Linux) os=linux ;; *) echo 'tin: unsupported OS' >&2; exit 1 ;; esac
+case $(uname -m) in arm64|aarch64) arch=arm64 ;; x86_64|amd64) arch=amd64 ;; *) echo 'tin: unsupported architecture' >&2; exit 1 ;; esac
+dir=${TINBOX_TIN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tinbox/tin}
+root=$dir/versions/tin-$version-$os-$arch
+if [ ! -x "$root/tin" ]; then
+  echo "tin: installing Tin $version in $dir" >&2
+  mkdir -p "$dir"
+  curl -fsSL "https://github.com/yasserreslan/tin/releases/download/v$version/install.sh" -o "$dir/install-$version.sh"
+  TIN_INSTALL_DIR=$dir sh "$dir/install-$version.sh" "$version" >&2
+fi
+TIN_ROOT=$root exec "$root/tin" "$@"

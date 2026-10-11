@@ -1,0 +1,897 @@
+package api
+
+import "../../proto"
+import "../auth"
+import "../db"
+import "../store"
+import "../tree"
+import "anvil"
+import "argo"
+import "constraints"
+import "fault"
+import "herald"
+import "mint"
+import "postgres"
+import "seal"
+import "tide"
+
+// tinbox's HTTP API under /v1 (design/backend.md, "Requests"): JSON in and out, every request signed by a device
+// (Tinbox-Signature), except GET /v1/nonce and the three a new Mac signs with the key it is registering.
+
+// WaitFor is how long GET .../wait holds a request open; WaitPoll how often it looks at the head meanwhile.
+const WaitFor = 55 * tide.Second
+const WaitPoll = 500 * tide.Millisecond
+
+// URLLife is how many seconds a block URL lasts.
+const URLLife = 900
+
+// DeltaPage, SnapshotPage: the most rows one page gives.
+const DeltaPage = 1000
+const SnapshotPage = 5000
+
+// Deps is what the handlers use, set on each core with Configure.
+type Deps struct {
+	Db        postgres.Client
+	Store     store.Store
+	NonceKey  secret str // the configured secret, "" to use the database's
+	ViaServer bool
+	PublicURL str
+	Version   str
+}
+
+mut deps ?Deps = nil
+
+// nonceSecret is this core's nonce secret, read on first use: the configured one, else the one the database keeps.
+// It cannot be read when the core starts, because core 0 starts before main has run the migrations.
+mut nonceSecret str = ""
+
+// Configure sets this core's dependencies.
+fn Configure(d Deps) {
+	deps = keep(d)
+}
+
+fn current() !Deps {
+	let got = deps
+	if got == nil {
+		fail "api: not configured"
+	}
+	return got
+}
+
+// ErrorBody is the error member of an error answer.
+type ErrorBody struct {
+	@json("code") Code str
+	@json("message") Message str
+}
+
+// ErrorOut is every error answer; Nonce is a fresh nonce to sign the retry with.
+type ErrorOut struct {
+	@json("error") Error ErrorBody
+	@json("nonce") Nonce str
+}
+
+fn secretKey() !str {
+	if len(nonceSecret) > 0 {
+		return nonceSecret
+	}
+	let d = try current()
+	let k = try db.NonceSecret(d.Db, d.NonceKey)
+	nonceSecret = keep(k)
+	return nonceSecret
+}
+
+fn freshNonce() str {
+	let k = secretKey() catch err {
+		herald.Log(herald.LError, "the nonce secret", []str{"error", fault.Message(err)})
+		return ""
+	}
+	return auth.NewNonce(k, tide.Wall() / tide.Second)
+}
+
+fn sendJSON[T constraints.Any](w mut anvil.Out, v T) {
+	w.Json()
+	argo.Put(mut w.Body, v)
+}
+
+// sendFault answers with the status and code a fault maps to.
+fn sendFault(q anvil.Req, w mut anvil.Out, err fault) {
+	mut s = 500
+	mut c = "Internal"
+	if fault.Is(err, proto.ErrInvalid) {
+		s = 400
+		c = "BadRequest"
+	} else if fault.Is(err, proto.ErrUnauthorized) {
+		s = 401
+		c = "Unauthorized"
+	} else if fault.Is(err, proto.ErrNonce) {
+		s = 401
+		c = "NonceExpired"
+	} else if fault.Is(err, proto.ErrForbidden) {
+		s = 403
+		c = "Forbidden"
+	} else if fault.Is(err, proto.ErrNotFound) {
+		s = 404
+		c = "NotFound"
+	} else if fault.Is(err, proto.ErrConflict) {
+		s = 409
+		c = "Conflict"
+	} else if fault.Is(err, proto.ErrTooLarge) || fault.Is(err, fault.LimitExceeded) {
+		s = 413
+		c = "TooLarge"
+	} else if fault.Is(err, proto.ErrBadBlock) {
+		s = 422
+		c = "BadBlock"
+	} else if fault.Is(err, proto.ErrQuota) {
+		s = 507
+		c = "QuotaExceeded"
+	} else if fault.Is(err, fault.DeadlineExceeded) {
+		s = 504
+		c = "Timeout"
+	}
+	if s == 500 {
+		herald.Log(herald.LError, "request failed", []str{"method", q.Method, "path", q.Path, "error", fault.Message(err)})
+	}
+	mut nonce = ""
+	if s == 401 {
+		nonce = freshNonce()
+	}
+	w.Status(s)
+	sendJSON(mut w, ErrorOut{Error: ErrorBody{Code: c, Message: fault.Message(err)}, Nonce: nonce})
+}
+
+fn badRequest(q anvil.Req, w mut anvil.Out, message str) {
+	sendFault(q, mut w, fault.Wrap(proto.ErrInvalid, message))
+}
+
+// target is what a signature covers of the request line: the path and, when there is one, the query.
+fn target(q anvil.Req) str {
+	if len(q.Query) > 0 {
+		return q.Path + "?" + q.Query
+	}
+	return q.Path
+}
+
+fn bodyHash(q anvil.Req) str {
+	return seal.Hex(seal.Sha256(q.Body()))
+}
+
+// caller is the device that signed the request; on a refusal it answers and gives nil.
+fn caller(q anvil.Req, w mut anvil.Out) ?auth.Caller {
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return nil
+	}
+	let key = secretKey() catch err {
+		sendFault(q, mut w, err)
+		return nil
+	}
+	let who = auth.Verify(d.Db, key, q.Method, target(q), q.Header(proto.SignatureHeader), bodyHash(q), tide.Wall() / tide.Second) catch err {
+		sendFault(q, mut w, err)
+		return nil
+	}
+	return who
+}
+
+// member is the caller when they are a member of the path's team (an owner when owner is set); else it answers and
+// gives nil.
+fn member(q anvil.Req, w mut anvil.Out, owner bool) ?auth.Caller {
+	let who = caller(q, mut w)
+	if who == nil {
+		return nil
+	}
+	let team = teamOf(q)
+	if team <= 0 {
+		badRequest(q, mut w, "bad team id")
+		return nil
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return nil
+	}
+	_ = auth.Require(d.Db, who, team, owner) catch err {
+		sendFault(q, mut w, err)
+		return nil
+	}
+	return who
+}
+
+fn teamOf(q anvil.Req) i64 {
+	let n = mint.Atoi(q.PathParam("team")) catch _ {
+		0
+	}
+	return n
+}
+
+fn idOf(q anvil.Req, name str) i64 {
+	let n = mint.Atoi(q.PathParam(name)) catch _ {
+		0
+	}
+	return n
+}
+
+fn queryInt(q anvil.Req, name str, fallback i64) i64 {
+	let v = q.Param(name)
+	if len(v) == 0 {
+		return fallback
+	}
+	let n = mint.Atoi(v) catch _ {
+		-1
+	}
+	return n
+}
+
+// ---- health and nonces ----
+
+// StatusOut is GET /healthz and /readyz.
+type StatusOut struct {
+	@json("status") Status str
+	@json("version") Version str
+}
+
+fn healthz(q anvil.Req, w mut anvil.Out) {
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, StatusOut{Status: "ok", Version: d.Version})
+}
+
+fn readyz(q anvil.Req, w mut anvil.Out) {
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	db.Current(d.Db) catch err {
+		w.Status(503)
+		sendJSON(mut w, StatusOut{Status: fault.Message(err), Version: d.Version})
+		return
+	}
+	sendJSON(mut w, StatusOut{Status: "ready", Version: d.Version})
+}
+
+// NonceOut is GET /v1/nonce.
+type NonceOut struct {
+	@json("nonce") Nonce str
+	@json("life") Life i64
+}
+
+fn nonce(q anvil.Req, w mut anvil.Out) {
+	sendJSON(mut w, NonceOut{Nonce: freshNonce(), Life: auth.NonceLife})
+}
+
+// ---- joining ----
+
+// AcceptIn is POST /v1/invites/accept, signed by the new key as device "new".
+type AcceptIn struct {
+	@json("code") Code str max 64
+	@json("name") Name str max 100
+	@json("device_name") DeviceName str max 100
+	@json("public_key") PublicKey str max 64
+}
+
+// LinkIn is POST /v1/links, signed by the new key.
+type LinkIn struct {
+	@json("device_name") DeviceName str max 100
+	@json("public_key") PublicKey str max 64
+}
+
+// CodeIn is POST /v1/links/approve and, with the key, /v1/links/claim.
+type CodeIn struct {
+	@json("code") Code str max 64
+	@json("public_key") PublicKey str max 64
+}
+
+// CodeOut answers with a code.
+type CodeOut struct {
+	@json("code") Code str
+	@json("expires_in") ExpiresIn i64
+}
+
+fn newKey(q anvil.Req, w mut anvil.Out, encoded str) ?[]u8 {
+	let pub = seal.B64Decode(encoded) catch _ {
+		badRequest(q, mut w, "public_key is not base64")
+		return nil
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return nil
+	}
+	let key = secretKey() catch err {
+		sendFault(q, mut w, err)
+		return nil
+	}
+	auth.VerifyNew(key, q.Method, target(q), q.Header(proto.SignatureHeader), bodyHash(q), pub, tide.Wall() / tide.Second) catch err {
+		sendFault(q, mut w, err)
+		return nil
+	}
+	return pub
+}
+
+fn acceptInvite(q anvil.Req, w mut anvil.Out) {
+	mut in = AcceptIn{}
+	argo.GetStrict(q.Body(), mut in) catch err {
+		badRequest(q, mut w, fault.Message(err))
+		return
+	}
+	let pub = newKey(q, mut w, in.PublicKey)
+	if pub == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let j = auth.AcceptInvite(d.Db, in.Code, in.Name, in.DeviceName, pub) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	w.Status(201)
+	sendJSON(mut w, j)
+}
+
+fn startLink(q anvil.Req, w mut anvil.Out) {
+	mut in = LinkIn{}
+	argo.GetStrict(q.Body(), mut in) catch err {
+		badRequest(q, mut w, fault.Message(err))
+		return
+	}
+	let pub = newKey(q, mut w, in.PublicKey)
+	if pub == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let code = auth.StartLink(d.Db, in.DeviceName, pub) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	w.Status(201)
+	sendJSON(mut w, CodeOut{Code: code, ExpiresIn: auth.LinkMinutes * 60})
+}
+
+// ApprovedOut names the Mac a link approved.
+type ApprovedOut struct {
+	@json("device_name") DeviceName str
+}
+
+fn approveLink(q anvil.Req, w mut anvil.Out) {
+	let who = caller(q, mut w)
+	if who == nil {
+		return
+	}
+	mut in = CodeIn{}
+	argo.GetStrict(q.Body(), mut in) catch err {
+		badRequest(q, mut w, fault.Message(err))
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let name = auth.ApproveLink(d.Db, who, in.Code) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, ApprovedOut{DeviceName: name})
+}
+
+fn claimLink(q anvil.Req, w mut anvil.Out) {
+	mut in = CodeIn{}
+	argo.GetStrict(q.Body(), mut in) catch err {
+		badRequest(q, mut w, fault.Message(err))
+		return
+	}
+	let pub = newKey(q, mut w, in.PublicKey)
+	if pub == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let j = auth.ClaimLink(d.Db, in.Code, pub) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	w.Status(201)
+	sendJSON(mut w, j)
+}
+
+// ---- you, your Macs, your teams ----
+
+fn me(q anvil.Req, w mut anvil.Out) {
+	let who = caller(q, mut w)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let m = auth.Me(d.Db, who) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, m)
+}
+
+// OkOut is an answer with nothing else to say.
+type OkOut struct {
+	@json("ok") Ok bool
+}
+
+fn revokeDevice(q anvil.Req, w mut anvil.Out) {
+	let who = caller(q, mut w)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	auth.RevokeDevice(d.Db, who, idOf(q, "id")) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, OkOut{Ok: true})
+}
+
+// TeamIn is POST /v1/teams.
+type TeamIn struct {
+	@json("name") Name str max 100
+}
+
+fn createTeam(q anvil.Req, w mut anvil.Out) {
+	let who = caller(q, mut w)
+	if who == nil {
+		return
+	}
+	mut in = TeamIn{}
+	argo.GetStrict(q.Body(), mut in) catch err {
+		badRequest(q, mut w, fault.Message(err))
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let t = auth.CreateTeam(d.Db, who, in.Name) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	w.Status(201)
+	sendJSON(mut w, t)
+}
+
+// MembersOut is GET /v1/teams/{team}/members.
+type MembersOut struct {
+	@json("members") Members []auth.MemberOut
+}
+
+fn members(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let ms = auth.Members(d.Db, who, teamOf(q)) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, MembersOut{Members: ms})
+}
+
+fn removeMember(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, true)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	auth.RemoveMember(d.Db, who, teamOf(q), idOf(q, "user")) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, OkOut{Ok: true})
+}
+
+// InviteIn is POST /v1/teams/{team}/invites.
+type InviteIn struct {
+	@json("email") Email str max 254
+	@json("role") Role str max 16
+}
+
+fn invite(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, true)
+	if who == nil {
+		return
+	}
+	mut in = InviteIn{}
+	argo.GetStrict(q.Body(), mut in) catch err {
+		badRequest(q, mut w, fault.Message(err))
+		return
+	}
+	mut role str = in.Role
+	if len(role) == 0 {
+		role = auth.RoleMember
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let code = auth.Invite(d.Db, who, teamOf(q), in.Email, role) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	w.Status(201)
+	sendJSON(mut w, CodeOut{Code: code, ExpiresIn: auth.InviteDays * 86400})
+}
+
+// ---- the folder ----
+
+fn head(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let h = tree.Head(d.Db, teamOf(q)) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, h)
+}
+
+fn delta(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let cursor = queryInt(q, "cursor", 0)
+	mut size = queryInt(q, "limit", DeltaPage)
+	if cursor < 0 || size < 1 {
+		badRequest(q, mut w, "cursor and limit are numbers")
+		return
+	}
+	size = min(size, DeltaPage)
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let o = tree.Delta(d.Db, teamOf(q), cursor, size) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, o)
+}
+
+fn wait(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let cursor = queryInt(q, "cursor", 0)
+	if cursor < 0 {
+		badRequest(q, mut w, "cursor is a number")
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let team = teamOf(q)
+	let start = tide.Now()
+	for {
+		let h = tree.Head(d.Db, team) catch err {
+			sendFault(q, mut w, err)
+			return
+		}
+		if h.Seq != cursor || tide.Since(start) >= WaitFor {
+			sendJSON(mut w, h)
+			return
+		}
+		tide.Wait(WaitPoll) catch _ {
+			sendJSON(mut w, h)
+			return
+		}
+	}
+}
+
+fn snapshot(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let after = queryInt(q, "after", 0)
+	mut size = queryInt(q, "limit", SnapshotPage)
+	if after < 0 || size < 1 {
+		badRequest(q, mut w, "after and limit are numbers")
+		return
+	}
+	size = min(size, SnapshotPage)
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let o = tree.Snapshot(d.Db, teamOf(q), after, size) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, o)
+}
+
+fn node(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let n = tree.Get(d.Db, teamOf(q), idOf(q, "id")) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, n)
+}
+
+// NodesOut is a list of nodes.
+type NodesOut struct {
+	@json("nodes") Nodes []proto.NodeOut
+}
+
+fn children(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let ns = tree.Children(d.Db, teamOf(q), idOf(q, "id")) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, NodesOut{Nodes: ns})
+}
+
+// VersionsOut is GET .../nodes/{id}/versions.
+type VersionsOut struct {
+	@json("versions") Versions []tree.VersionOut
+}
+
+fn versions(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let vs = tree.Versions(d.Db, teamOf(q), idOf(q, "id")) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, VersionsOut{Versions: vs})
+}
+
+fn trash(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let ns = tree.Trash(d.Db, teamOf(q)) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, NodesOut{Nodes: ns})
+}
+
+// RestoreIn is POST .../nodes/{id}/restore: rev 0 brings a node back from the trash as it was.
+type RestoreIn struct {
+	@json("rev") Rev i64
+}
+
+fn restore(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	mut in = RestoreIn{}
+	if len(q.Body()) > 0 {
+		argo.GetStrict(q.Body(), mut in) catch err {
+			badRequest(q, mut w, fault.Message(err))
+			return
+		}
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let r = tree.Restore(d.Db, teamOf(q), who.Device, idOf(q, "id"), in.Rev) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, r)
+}
+
+// RewindIn is POST .../rewind.
+type RewindIn struct {
+	@json("seq") Seq i64
+}
+
+fn rewind(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, true)
+	if who == nil {
+		return
+	}
+	mut in = RewindIn{}
+	argo.GetStrict(q.Body(), mut in) catch err {
+		badRequest(q, mut w, fault.Message(err))
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let r = tree.Rewind(d.Db, teamOf(q), who.Device, in.Seq) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, r)
+}
+
+fn commit(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	mut in = proto.CommitIn{}
+	argo.GetStrict(q.Body(), mut in) catch err {
+		badRequest(q, mut w, fault.Message(err))
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let o = tree.Commit(d.Db, teamOf(q), who.Device, in) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, o)
+}
+
+// ---- blocks ----
+
+fn missing(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	mut in = tree.HashesIn{}
+	argo.GetStrict(q.Body(), mut in) catch err {
+		badRequest(q, mut w, fault.Message(err))
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let o = tree.Missing(d.Db, teamOf(q), in) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, o)
+}
+
+// BlockOut answers an upload.
+type BlockOut struct {
+	@json("hash") Hash str
+	@json("size") Size i64
+}
+
+fn putBlock(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let hash = q.PathParam("hash")
+	let body = q.Body()
+	tree.PutBlock(d.Db, d.Store, teamOf(q), hash, body) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, BlockOut{Hash: hash, Size: len(body)})
+}
+
+fn getBlock(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let data = tree.GetBlock(d.Db, d.Store, teamOf(q), q.PathParam("hash")) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	w.Type("application/octet-stream")
+	w.Body = append(w.Body, []u8(data)...)
+}
+
+fn urls(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	mut in = tree.HashesIn{}
+	argo.GetStrict(q.Body(), mut in) catch err {
+		badRequest(q, mut w, fault.Message(err))
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let o = tree.URLs(d.Db, d.Store, teamOf(q), in, d.ViaServer, d.PublicURL, URLLife) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, o)
+}
+
+// Mount adds every route to r.
+fn Mount(r mut anvil.Router) {
+	r.Get("/healthz", healthz)
+	r.Get("/readyz", readyz)
+	r.Get("/v1/nonce", nonce)
+	r.Post("/v1/invites/accept", acceptInvite)
+	r.Post("/v1/links", startLink)
+	r.Post("/v1/links/approve", approveLink)
+	r.Post("/v1/links/claim", claimLink)
+	r.Get("/v1/me", me)
+	r.Delete(`/v1/devices/{id}`, revokeDevice)
+	r.Post("/v1/teams", createTeam)
+	r.Get(`/v1/teams/{team}/members`, members)
+	r.Delete(`/v1/teams/{team}/members/{user}`, removeMember)
+	r.Post(`/v1/teams/{team}/invites`, invite)
+	r.Get(`/v1/teams/{team}/head`, head)
+	r.Get(`/v1/teams/{team}/delta`, delta)
+	r.Get(`/v1/teams/{team}/wait`, wait)
+	r.Get(`/v1/teams/{team}/snapshot`, snapshot)
+	r.Get(`/v1/teams/{team}/nodes/{id}`, node)
+	r.Get(`/v1/teams/{team}/nodes/{id}/children`, children)
+	r.Get(`/v1/teams/{team}/nodes/{id}/versions`, versions)
+	r.Post(`/v1/teams/{team}/nodes/{id}/restore`, restore)
+	r.Get(`/v1/teams/{team}/trash`, trash)
+	r.Post(`/v1/teams/{team}/rewind`, rewind)
+	r.Post(`/v1/teams/{team}/commit`, commit)
+	r.Post(`/v1/teams/{team}/blocks/missing`, missing)
+	r.Post(`/v1/teams/{team}/blocks/urls`, urls)
+	r.Put(`/v1/teams/{team}/blocks/{hash}`, putBlock)
+	r.Get(`/v1/teams/{team}/blocks/{hash}`, getBlock)
+}

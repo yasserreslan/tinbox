@@ -1,0 +1,326 @@
+package main
+
+import "./api"
+import "./auth"
+import "./config"
+import "./db"
+import "./store"
+import "./tree"
+import "anvil"
+import "fault"
+import "hearth"
+import "herald"
+import "quarry"
+import "say"
+import "signal"
+import "tide"
+import "tls"
+
+// tinbox: team folders synced across Macs, like iCloud Drive (design/backend.md). One binary: the HTTP API, and the
+// background jobs (the block sweep every hour, the history purge and the store check every day) on core 0.
+
+const version = "0.1.0"
+
+// Boot is what the command line and the configuration say, read the same way on every core.
+type Boot struct {
+	Command str
+	Args    []str
+	Flags   map[str]str
+	Conf    config.Config
+	Err     str
+}
+
+fn usage() str {
+	return "usage: tinbox run [--config FILE]\n       tinbox migrate [--config FILE]\n       tinbox admin invite EMAIL --team NAME [--role owner|member] [--config FILE]\n       tinbox admin new-epoch [--config FILE]\n       tinbox check [--deep] [--config FILE]\n       tinbox sweep [--config FILE]\n       tinbox version\n"
+}
+
+// valued is every flag that takes a value; others are switches.
+fn valued(flag str) bool {
+	return flag == "--config" || flag == "--team" || flag == "--role"
+}
+
+fn parseBoot(argv []str) Boot {
+	mut command = ""
+	mut rest = []str{}
+	mut flags = map[str]str{}
+	mut i = 1
+	for i < len(argv) {
+		let a = argv[i]
+		if len(a) > 2 && a[0:2] == "--" {
+			if valued(a) {
+				if i + 1 >= len(argv) {
+					return Boot{Command: command, Args: rest, Flags: flags, Conf: config.Defaults(), Err: "{a} needs a value"}
+				}
+				flags[a] = argv[i + 1]
+				i += 2
+				continue
+			}
+			flags[a] = "true"
+			i += 1
+			continue
+		}
+		if len(command) == 0 {
+			command = a
+		} else {
+			rest = append(rest, a)
+		}
+		i += 1
+	}
+	if command == "version" || command == "" || command == "help" || command == "-h" {
+		return Boot{Command: command, Args: rest, Flags: flags, Conf: config.Defaults(), Err: ""}
+	}
+	let needStore = command == "run" || command == "check" || command == "sweep"
+	let c = config.LoadFor(config.Path(flags["--config"]), needStore) catch err {
+		return Boot{Command: command, Args: rest, Flags: flags, Conf: config.Defaults(), Err: fault.Message(err)}
+	}
+	return Boot{Command: command, Args: rest, Flags: flags, Conf: c, Err: ""}
+}
+
+let boot = parseBoot(quarry.Args())
+
+fn dbOptions(c config.Config) db.Options {
+	return db.Options{Addr: c.DbAddr, User: c.DbUser, Password: c.DbPassword, Name: c.DbName, SSLMode: c.DbSSLMode, MaxTotal: c.DbMaxTotal}
+}
+
+fn storeOptions(c config.Config) store.Options {
+	return store.Options{Kind: c.Store, Dir: c.StoreDir, Endpoint: c.S3Endpoint, Region: c.S3Region, Bucket: c.S3Bucket, AccessKey: c.S3AccessKey, SecretKey: c.S3SecretKey, PathStyle: c.S3PathStyle}
+}
+
+// pg is this core's database client; blobs the block store.
+let pg = db.Open(dbOptions(boot.Conf))
+let blobs = store.Open(storeOptions(boot.Conf))
+
+fn level(name str) i64 {
+	return match name {
+		"debug" => herald.LDebug
+		"warn" => herald.LWarn
+		"error" => herald.LError
+		_ => herald.LInfo
+	}
+}
+
+fn serving() bool {
+	return boot.Command == "run" && len(boot.Err) == 0
+}
+
+on core.start {
+	herald.SetLevel(level(boot.Conf.LogLevel))
+	if serving() {
+		api.Configure(api.Deps{Db: pg, Store: blobs, NonceKey: boot.Conf.NonceSecret, ViaServer: boot.Conf.Downloads == "server", PublicURL: boot.Conf.PublicURL, Version: version})
+		if boot.Conf.Jobs && hearth.ID() == 0 {
+			detach {
+				jobLoop()
+			}
+		}
+	}
+}
+
+// jobs runs one round of the background work: the sweep every time, and once a day the purge before it and the check
+// after it (a deep one, which reads every block, once a week).
+fn jobs(round i64) {
+	let teams = tree.Teams(pg) catch err {
+		herald.Log(herald.LError, "jobs: listing teams", []str{"error", fault.Message(err)})
+		return
+	}
+	for t in teams {
+		let daily = round % 24 == 0
+		if daily {
+			let p = tree.Purge(pg, t, boot.Conf.HistoryDays) catch err {
+				herald.Log(herald.LError, "purge", []str{"team", say.Str(t), "error", fault.Message(err)})
+				continue
+			}
+			herald.Log(herald.LInfo, "purge", []str{"team", say.Str(t), "journal", say.Str(p.Journal), "versions", say.Str(p.Versions), "trash", say.Str(p.Trash), "floor", say.Str(p.Floor)})
+		}
+		let swept = tree.Sweep(pg, blobs, t) catch err {
+			herald.Log(herald.LError, "sweep", []str{"team", say.Str(t), "error", fault.Message(err)})
+			0
+		}
+		if swept > 0 {
+			herald.Log(herald.LInfo, "sweep", []str{"team", say.Str(t), "blocks", say.Str(swept)})
+		}
+		if !daily {
+			continue
+		}
+		let c = tree.Check(pg, blobs, t, round % 168 == 0) catch err {
+			herald.Log(herald.LError, "check", []str{"team", say.Str(t), "error", fault.Message(err)})
+			continue
+		}
+		mut lvl = herald.LInfo
+		if c.Lost > 0 || c.BadDirs > 0 {
+			lvl = herald.LWarn
+		}
+		herald.Log(lvl, "check", []str{"team", say.Str(t), "blocks", say.Str(c.Blocks), "lost", say.Str(c.Lost), "orphans", say.Str(c.Orphans), "bad_dirs", say.Str(c.BadDirs)})
+	}
+}
+
+// jobLoop runs the jobs an hour apart, starting a minute after the server, until the drain cancels it.
+fn jobLoop() {
+	mut round = 0
+	mut wait = tide.Minute
+	for {
+		mut stop = false
+		hearth.Quiet(fn() {
+			tide.Wait(wait) catch _ {
+				stop = true
+			}
+		})
+		if stop {
+			return
+		}
+		arena {
+			jobs(round)
+		}
+		round += 1
+		wait = tide.Hour
+	}
+}
+
+// logged writes one log line for each request; health checks and nonces only at debug level.
+fn logged(q anvil.Req, w mut anvil.Out, next fn(anvil.Req, mut anvil.Out)) {
+	let start = tide.Now()
+	next(q, mut w)
+	mut lvl = herald.LInfo
+	if q.Path == "/healthz" || q.Path == "/v1/nonce" {
+		lvl = herald.LDebug
+	}
+	herald.Log(lvl, "request", []str{"method", q.Method, "route", q.Pattern(), "status", say.Str(w.Code()), "ms", say.Str(tide.Since(start) / tide.Millisecond)})
+}
+
+// prepare migrates (unless migrate = false) and checks the schema.
+fn prepare(c config.Config) ! {
+	if c.Migrate {
+		let n = try db.Migrate(pg) wrap "migrating"
+		if n > 0 {
+			herald.Log(herald.LInfo, "migrated", []str{"applied", say.Str(n)})
+		}
+	}
+	try db.Current(pg)
+}
+
+fn run(c config.Config) ! {
+	try prepare(c)
+	if len(blobs.Err) > 0 {
+		fail "the block store: {blobs.Err}"
+	}
+	try blobs.Probe() wrap "the block store ({c.Store})"
+	// GET .../wait holds a request open for 55 s: every request may take 70 s
+	anvil.Deadline(70000)
+	let (_, set) = quarry.LookupEnv("TIN_REQUEST_MEMORY")
+	if !set {
+		try quarry.Setenv("TIN_REQUEST_MEMORY", "0")
+	}
+	mut r = anvil.NewRouter()
+	r.Use(logged)
+	api.Mount(mut r)
+	herald.Log(herald.LInfo, "tinbox starting", []str{"version", version, "listen", c.Listen, "store", c.Store, "downloads", c.Downloads, "db", c.DbAddr})
+	try signal.Ignore(signal.SIGHUP)
+	if len(c.TLSCert) > 0 {
+		let cert = anvil.TLSCert{CertPEM: "", KeyPEM: "", CertFile: c.TLSCert, KeyFile: c.TLSKey}
+		try r.ServeTLSConfig(c.Listen, anvil.TLSConfig{CertPEM: "", KeyPEM: "", Certificates: []anvil.TLSCert{cert}, ClientAuth: 0, ClientCAs: "", MinVersion: tls.VersionTLS13})
+		return
+	}
+	try r.Serve(c.Listen)
+}
+
+fn migrate() ! {
+	let n = try db.Migrate(pg)
+	let at = try db.Applied(pg)
+	say.Line("tinbox: applied {n} migrations; the database is at migration {at}")
+}
+
+fn invite(b Boot) ! {
+	if len(b.Args) != 2 || b.Args[0] != "invite" {
+		fail "usage: tinbox admin invite EMAIL --team NAME [--role owner|member]"
+	}
+	let team = b.Flags["--team"]
+	if len(team) == 0 {
+		fail "tinbox admin invite needs --team NAME (a team of that name is made when there is none)"
+	}
+	mut role = b.Flags["--role"]
+	if len(role) == 0 {
+		role = auth.RoleOwner
+	}
+	try prepare(b.Conf)
+	let email = b.Args[1]
+	let code = try auth.AdminInvite(pg, email, team, role)
+	say.Line("Invite for {email} to team {team} as {role}, valid {auth.InviteDays} days:")
+	say.Line("")
+	say.Line("  {code}")
+	say.Line("")
+	say.Line("Enter it in the tinbox app with this server's URL. It works once.")
+}
+
+fn newEpoch(b Boot) ! {
+	try prepare(b.Conf)
+	let n = try tree.NewEpochs(pg)
+	say.Line("tinbox: {n} teams have a new epoch; their Macs will merge without deleting on their next sync")
+}
+
+fn check(b Boot) ! {
+	try prepare(b.Conf)
+	let deep = b.Flags["--deep"] == "true"
+	let teams = try tree.Teams(pg)
+	mut bad = 0
+	for t in teams {
+		let c = try tree.Check(pg, blobs, t, deep)
+		say.Line("team {t}: {c.Blocks} blocks, {c.Lost} lost, {c.Orphans} orphan objects, {c.BadDirs} folder hashes fixed")
+		bad += c.Lost + c.BadDirs
+	}
+	if bad > 0 {
+		quarry.Exit(1)
+	}
+}
+
+fn sweep(b Boot) ! {
+	try prepare(b.Conf)
+	let teams = try tree.Teams(pg)
+	for t in teams {
+		let p = try tree.Purge(pg, t, b.Conf.HistoryDays)
+		let n = try tree.Sweep(pg, blobs, t)
+		say.Line("team {t}: {n} blocks swept; {p.Journal} journal rows, {p.Versions} versions and {p.Trash} trashed items purged")
+	}
+}
+
+fn main() {
+	let b = boot
+	if b.Command == "version" {
+		say.Line("tinbox {version}")
+		return
+	}
+	if b.Command == "" || b.Command == "help" || b.Command == "-h" {
+		say.Text(usage())
+		return
+	}
+	if len(b.Err) > 0 {
+		quarry.Eprintln("tinbox: {b.Err}")
+		quarry.Exit(2)
+	}
+	let err = match b.Command {
+		"run" => run(b.Conf)
+		"migrate" => migrate()
+		"admin" => adminCommand(b)
+		"check" => check(b)
+		"sweep" => sweep(b)
+		_ => unknown(b.Command)
+	}
+	if err != nil {
+		quarry.Eprintln("tinbox: {fault.Message(err)}")
+		quarry.Exit(1)
+	}
+}
+
+fn adminCommand(b Boot) ! {
+	if len(b.Args) > 0 && b.Args[0] == "invite" {
+		try invite(b)
+		return
+	}
+	if len(b.Args) == 1 && b.Args[0] == "new-epoch" {
+		try newEpoch(b)
+		return
+	}
+	fail "usage: tinbox admin invite EMAIL --team NAME | tinbox admin new-epoch"
+}
+
+fn unknown(command str) ! {
+	fail "unknown command {command:q}\n{usage()}"
+}

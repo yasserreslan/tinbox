@@ -1,0 +1,21 @@
+# tinbox's configuration (design/backend.md, section 3). Every key may also come from the environment:
+# TINBOX_ and the key in upper case with dots as underscores. A value file:PATH is read from that file.
+listen = :8080
+public_url = https://box.example.org
+
+db.url = file:/run/secrets/tinbox-db-url
+db.max_total = 10
+
+store = s3
+s3.endpoint = https://ACCOUNT_ID.r2.cloudflarestorage.com
+s3.region = auto
+s3.bucket = tinbox
+s3.access_key = R2_ACCESS_KEY_ID
+s3.secret_key = file:/run/secrets/tinbox-s3
+
+# Serve TLS here when no proxy does it in front of tinbox.
+# tls.cert = /etc/tinbox/tls/fullchain.pem
+# tls.key = /etc/tinbox/tls/privkey.pem
+
+history.days = 30
+log.level = info

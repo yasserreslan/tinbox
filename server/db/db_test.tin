@@ -1,0 +1,14 @@
+package db
+
+import "crucible"
+import "twine"
+
+fn TestMigrations(t mut crucible.T) {
+	let ms = Migrations() catch err {
+		t.Error("migrations: {err}")
+		return
+	}
+	crucible.Equal(mut t, "count", len(ms), 1)
+	crucible.Equal(mut t, "name", ms[0].Name, "init")
+	t.True("has nodes", twine.Contains(ms[0].Text, "CREATE TABLE nodes"))
+}

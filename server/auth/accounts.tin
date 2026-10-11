@@ -1,0 +1,430 @@
+package auth
+
+import "../../proto"
+import "fault"
+import "postgres"
+import "seal"
+import "twine"
+
+// People, teams and Macs: a team's members read and change every file of its folder; owners also invite and remove
+// members and rewind the folder. A person joins with a one-use invite code; another of their Macs joins by showing a
+// short code that one of their signed-in Macs approves.
+
+// RoleOwner and RoleMember are a member's roles.
+const RoleOwner = "owner"
+const RoleMember = "member"
+
+// InviteDays is how long an invite lasts; LinkMinutes how long a device link does.
+const InviteDays = 7
+const LinkMinutes = 10
+
+// UserOut is a person as the API gives them.
+type UserOut struct {
+	@json("id") Id i64
+	@json("email") Email str
+	@json("name") Name str
+}
+
+// DeviceOut is one of a person's Macs.
+type DeviceOut struct {
+	@json("id") Id i64
+	@json("name") Name str
+	@json("created") Created i64
+	@json("last_seen") LastSeen i64
+	@json("current") Current bool
+}
+
+// TeamOut is a team as one of its members sees it.
+type TeamOut struct {
+	@json("id") Id i64
+	@json("name") Name str
+	@json("role") Role str
+	@json("root") Root i64
+}
+
+// MeOut is GET /v1/me.
+type MeOut struct {
+	@json("user") User UserOut
+	@json("device") Device i64
+	@json("devices") Devices []DeviceOut
+	@json("teams") Teams []TeamOut
+}
+
+// Joined is what accepting an invite or claiming a link gives the new Mac.
+type Joined struct {
+	@json("user") User UserOut
+	@json("device") Device i64
+	@json("team") Team i64
+	@json("role") Role str
+}
+
+// MemberOut is one member of a team.
+type MemberOut struct {
+	@json("user") User UserOut
+	@json("role") Role str
+}
+
+fn rollback(tx mut postgres.Tx) {
+	tx.Rollback() catch _ {
+	}
+}
+
+// normalize is a code as typed: upper case, without spaces and dashes.
+fn normalize(code str) str {
+	return twine.ToUpper(twine.ReplaceAll(twine.ReplaceAll(twine.TrimSpace(code), "-", ""), " ", ""))
+}
+
+// codeHash is what the database keeps of a code.
+fn codeHash(code str) str {
+	return seal.Hex(seal.Sha256(normalize(code)))
+}
+
+// newCode is a random code of n base-32 characters in groups of four.
+fn newCode(n i64) str {
+	let raw = seal.Base32Hex(seal.RandomBytes(n))
+	let s = raw[0:n]
+	mut b = twine.Builder{}
+	for i in 0..len(s) {
+		if i > 0 && i % 4 == 0 {
+			b.Str("-")
+		}
+		b.Byte(s[i])
+	}
+	return b.String()
+}
+
+fn checkEmail(email str) ! {
+	if len(email) < 3 || len(email) > 254 || !twine.Contains(email, "@") {
+		fail fault.Wrap(proto.ErrInvalid, "{email:q} is not an email address")
+	}
+}
+
+fn checkRole(role str) ! {
+	if role != RoleOwner && role != RoleMember {
+		fail fault.Wrap(proto.ErrInvalid, "role {role:q} is not owner or member")
+	}
+}
+
+fn audit(tx mut postgres.Tx, team i64, user i64, device i64, action str, detail str) ! {
+	_ = try tx.Exec("INSERT INTO audit_log (team_id, user_id, device_id, action, detail) VALUES (nullif({team}, 0), nullif({user}, 0), nullif({device}, 0), {action}, {detail})")
+}
+
+// RoleOf is the user's role in the team, "" when they are not a member.
+fn RoleOf(c postgres.Client, user i64, team i64) !str {
+	let rows = try c.Query("SELECT role FROM members WHERE team_id = {team} AND user_id = {user}")
+	if len(rows.Rows) == 0 {
+		return ""
+	}
+	return rows.Rows[0][0].Text()
+}
+
+// Require fails unless the caller is a member of the team (proto.ErrNotFound: a stranger learns nothing), and an owner
+// when owner is set (proto.ErrForbidden). It returns the role.
+fn Require(c postgres.Client, who Caller, team i64, owner bool) !str {
+	let role = try RoleOf(c, who.User, team)
+	if len(role) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "no team {team}")
+	}
+	if owner && role != RoleOwner {
+		fail fault.Wrap(proto.ErrForbidden, "only an owner of team {team} may do this")
+	}
+	return role
+}
+
+// NewTeam makes a team with an empty root folder and returns its id.
+fn NewTeam(tx mut postgres.Tx, name str) !i64 {
+	let n = twine.TrimSpace(name)
+	if len(n) == 0 || len(n) > 100 {
+		fail fault.Wrap(proto.ErrInvalid, "a team name has 1 to 100 characters")
+	}
+	let epoch = seal.Hex(seal.RandomBytes(16))
+	let t = try tx.Query("INSERT INTO teams (name, epoch) VALUES ({n}, {epoch}) RETURNING id")
+	let team = t.Rows[0][0].Int()
+	let empty = proto.EmptyDirHash()
+	let root = try tx.Query("INSERT INTO nodes (team_id, id, parent_id, name, name_key, kind, hash, size, mtime_ns, rev, place_rev) VALUES ({team}, nextval('node_ids'), NULL, '', '', 1, {empty}, 0, 0, 0, 0) RETURNING id")
+	let rootId = root.Rows[0][0].Int()
+	_ = try tx.Exec("UPDATE teams SET root_id = {rootId}, root_hash = {empty} WHERE id = {team}")
+	return team
+}
+
+// AdminInvite is `tinbox admin invite`: an invite to the team named teamName (made when no team has that name) for
+// email, with role. It returns the code.
+fn AdminInvite(c postgres.Client, email str, teamName str, role str) !str {
+	try checkEmail(email)
+	try checkRole(role)
+	mut tx = try c.Begin()
+	let (code, err) = adminInviteIn(mut tx, email, teamName, role)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+	return code
+}
+
+fn adminInviteIn(tx mut postgres.Tx, email str, teamName str, role str) !str {
+	let found = try tx.Query("SELECT id FROM teams WHERE lower(name) = lower({teamName}) ORDER BY id LIMIT 1")
+	mut team = 0
+	if len(found.Rows) == 1 {
+		team = found.Rows[0][0].Int()
+	} else {
+		team = try NewTeam(mut tx, teamName)
+	}
+	let code = try addInvite(mut tx, team, email, role, 0)
+	try audit(mut tx, team, 0, 0, "invite", "{email} as {role}, from the command line")
+	return code
+}
+
+fn addInvite(tx mut postgres.Tx, team i64, email str, role str, by i64) !str {
+	let code = "TBI-" + newCode(20)
+	let h = codeHash(code)
+	let days = InviteDays
+	_ = try tx.Exec("INSERT INTO invites (code_hash, team_id, email, role, created_by, expires_at) VALUES ({h}, {team}, {email}, {role}, nullif({by}, 0), now() + make_interval(days => {days}::int))")
+	return code
+}
+
+// Invite is an owner's invite to the team for email, with role; it returns the code.
+fn Invite(c postgres.Client, who Caller, team i64, email str, role str) !str {
+	try checkEmail(email)
+	try checkRole(role)
+	_ = try Require(c, who, team, true)
+	mut tx = try c.Begin()
+	let (code, err) = inviteIn(mut tx, who, team, email, role)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+	return code
+}
+
+fn inviteIn(tx mut postgres.Tx, who Caller, team i64, email str, role str) !str {
+	let code = try addInvite(mut tx, team, email, role, who.User)
+	try audit(mut tx, team, who.User, who.Device, "invite", "{email} as {role}")
+	return code
+}
+
+// addDevice registers pub for user and returns the device; the same live key of the same user is that device again.
+fn addDevice(tx mut postgres.Tx, user i64, name str, pub []u8) !i64 {
+	let n = twine.TrimSpace(name)
+	if len(n) == 0 || len(n) > 100 {
+		fail fault.Wrap(proto.ErrInvalid, "a device name has 1 to 100 characters")
+	}
+	let text = seal.B64(pub)
+	let have = try tx.Query("SELECT id, user_id, revoked_at IS NOT NULL FROM devices WHERE public_key = {text} FOR UPDATE")
+	if len(have.Rows) == 1 {
+		let r = have.Rows[0]
+		if r[1].Int() != user || r[2].Int() != 0 {
+			fail fault.Wrap(proto.ErrConflict, "this key belongs to another device; make a new key")
+		}
+		return r[0].Int()
+	}
+	let rows = try tx.Query("INSERT INTO devices (user_id, name, public_key) VALUES ({user}, {n}, {text}) RETURNING id")
+	return rows.Rows[0][0].Int()
+}
+
+fn userOut(tx mut postgres.Tx, user i64) !UserOut {
+	let rows = try tx.Query("SELECT id, email, name FROM users WHERE id = {user}")
+	if len(rows.Rows) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "no user {user}")
+	}
+	let r = rows.Rows[0]
+	return UserOut{Id: r[0].Int(), Email: r[1].Text(), Name: r[2].Text()}
+}
+
+// AcceptInvite spends an invite code: it makes the account when the invite's email has none, adds the team
+// membership and registers the new Mac's key.
+fn AcceptInvite(c postgres.Client, code str, name str, deviceName str, pub []u8) !Joined {
+	mut tx = try c.Begin()
+	let (j, err) = acceptIn(mut tx, code, name, deviceName, pub)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+	return j
+}
+
+fn acceptIn(tx mut postgres.Tx, code str, name str, deviceName str, pub []u8) !Joined {
+	let h = codeHash(code)
+	let inv = try tx.Query("SELECT team_id, email, role FROM invites WHERE code_hash = {h} AND used_at IS NULL AND expires_at > now() FOR UPDATE")
+	if len(inv.Rows) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "no such invite: it may have expired or been used")
+	}
+	let team = inv.Rows[0][0].Int()
+	let email = inv.Rows[0][1].Text()
+	let role = inv.Rows[0][2].Text()
+	let found = try tx.Query("SELECT id FROM users WHERE lower(email) = lower({email})")
+	mut user = 0
+	if len(found.Rows) == 1 {
+		user = found.Rows[0][0].Int()
+	} else {
+		mut display = twine.TrimSpace(name)
+		if len(display) == 0 {
+			let (local, _, _) = twine.Cut(email, "@")
+			display = local
+		}
+		let made = try tx.Query("INSERT INTO users (email, name) VALUES ({email}, {display}) RETURNING id")
+		user = made.Rows[0][0].Int()
+	}
+	_ = try tx.Exec("INSERT INTO members (team_id, user_id, role) VALUES ({team}, {user}, {role}) ON CONFLICT (team_id, user_id) DO UPDATE SET role = CASE WHEN EXCLUDED.role = 'owner' THEN 'owner' ELSE members.role END")
+	let device = try addDevice(mut tx, user, deviceName, pub)
+	_ = try tx.Exec("UPDATE invites SET used_at = now() WHERE code_hash = {h}")
+	try audit(mut tx, team, user, device, "join", "{email} as {role}")
+	let u = try userOut(mut tx, user)
+	let got = try tx.Query("SELECT role FROM members WHERE team_id = {team} AND user_id = {user}")
+	return Joined{User: u, Device: device, Team: team, Role: got.Rows[0][0].Text()}
+}
+
+// StartLink is a new Mac asking to join its user's account: it returns the short code to show.
+fn StartLink(c postgres.Client, deviceName str, pub []u8) !str {
+	let text = seal.B64(pub)
+	let live = try c.Query("SELECT 1 FROM devices WHERE public_key = {text}")
+	if len(live.Rows) > 0 {
+		fail fault.Wrap(proto.ErrConflict, "this key is registered already")
+	}
+	let n = twine.TrimSpace(deviceName)
+	if len(n) == 0 || len(n) > 100 {
+		fail fault.Wrap(proto.ErrInvalid, "a device name has 1 to 100 characters")
+	}
+	let code = newCode(8)
+	let h = codeHash(code)
+	let mins = LinkMinutes
+	_ = try c.Exec("INSERT INTO device_links (code_hash, public_key, device_name, state, expires_at) VALUES ({h}, {text}, {n}, 'pending', now() + make_interval(mins => {mins}::int))")
+	return code
+}
+
+// ApproveLink is a signed-in Mac approving a new Mac's code for its own user; it returns the new Mac's name.
+fn ApproveLink(c postgres.Client, who Caller, code str) !str {
+	let h = codeHash(code)
+	let user = who.User
+	let rows = try c.Query("UPDATE device_links SET state = 'approved', user_id = {user} WHERE code_hash = {h} AND state = 'pending' AND expires_at > now() RETURNING device_name")
+	if len(rows.Rows) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "no such code waiting: it may have expired")
+	}
+	return rows.Rows[0][0].Text()
+}
+
+// ClaimLink turns an approved code into a device for the key that started it.
+fn ClaimLink(c postgres.Client, code str, pub []u8) !Joined {
+	mut tx = try c.Begin()
+	let (j, err) = claimIn(mut tx, code, pub)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+	return j
+}
+
+fn claimIn(tx mut postgres.Tx, code str, pub []u8) !Joined {
+	let h = codeHash(code)
+	let rows = try tx.Query("SELECT public_key, device_name, coalesce(user_id, 0), state FROM device_links WHERE code_hash = {h} AND expires_at > now() FOR UPDATE")
+	if len(rows.Rows) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "no such code: it may have expired")
+	}
+	let r = rows.Rows[0]
+	if r[3].Text() != "approved" {
+		fail fault.Wrap(proto.ErrConflict, "the code is {r[3].Text()}, not approved yet")
+	}
+	if r[0].Text() != seal.B64(pub) {
+		fail fault.Wrap(proto.ErrForbidden, "the code was started by another key")
+	}
+	let user = r[2].Int()
+	let device = try addDevice(mut tx, user, r[1].Text(), pub)
+	_ = try tx.Exec("UPDATE device_links SET state = 'used' WHERE code_hash = {h}")
+	try audit(mut tx, 0, user, device, "link", r[1].Text())
+	let u = try userOut(mut tx, user)
+	return Joined{User: u, Device: device, Team: 0, Role: ""}
+}
+
+// Me is the caller, their Macs and their teams.
+fn Me(c postgres.Client, who Caller) !MeOut {
+	let devs = try c.Query("SELECT id, name, extract(epoch FROM created_at)::bigint, coalesce(extract(epoch FROM last_seen)::bigint, 0) FROM devices WHERE user_id = {who.User} AND revoked_at IS NULL ORDER BY id")
+	mut devices = []DeviceOut{}
+	for r in devs.Rows {
+		devices = append(devices, DeviceOut{Id: r[0].Int(), Name: r[1].Text(), Created: r[2].Int(), LastSeen: r[3].Int(), Current: r[0].Int() == who.Device})
+	}
+	let teams = try Teams(c, who)
+	return MeOut{User: UserOut{Id: who.User, Email: who.Email, Name: who.Name}, Device: who.Device, Devices: devices, Teams: teams}
+}
+
+// Teams is the caller's teams.
+fn Teams(c postgres.Client, who Caller) ![]TeamOut {
+	let rows = try c.Query("SELECT t.id, t.name, m.role, t.root_id FROM members m JOIN teams t ON t.id = m.team_id WHERE m.user_id = {who.User} ORDER BY t.id")
+	mut out = []TeamOut{}
+	for r in rows.Rows {
+		out = append(out, TeamOut{Id: r[0].Int(), Name: r[1].Text(), Role: r[2].Text(), Root: r[3].Int()})
+	}
+	return out
+}
+
+// RevokeDevice revokes one of the caller's own Macs.
+fn RevokeDevice(c postgres.Client, who Caller, id i64) ! {
+	let rows = try c.Query("UPDATE devices SET revoked_at = now() WHERE id = {id} AND user_id = {who.User} AND revoked_at IS NULL RETURNING name")
+	if len(rows.Rows) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "no device {id} of yours")
+	}
+	let user = who.User
+	let device = who.Device
+	let name = rows.Rows[0][0].Text()
+	_ = try c.Exec("INSERT INTO audit_log (user_id, device_id, action, detail) VALUES ({user}, {device}, 'revoke', {name})")
+}
+
+// CreateTeam makes a team with the caller as its owner.
+fn CreateTeam(c postgres.Client, who Caller, name str) !TeamOut {
+	mut tx = try c.Begin()
+	let (t, err) = createTeamIn(mut tx, who, name)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+	return t
+}
+
+fn createTeamIn(tx mut postgres.Tx, who Caller, name str) !TeamOut {
+	let team = try NewTeam(mut tx, name)
+	_ = try tx.Exec("INSERT INTO members (team_id, user_id, role) VALUES ({team}, {who.User}, 'owner')")
+	try audit(mut tx, team, who.User, who.Device, "team", name)
+	let rows = try tx.Query("SELECT name, root_id FROM teams WHERE id = {team}")
+	return TeamOut{Id: team, Name: rows.Rows[0][0].Text(), Role: RoleOwner, Root: rows.Rows[0][1].Int()}
+}
+
+// Members is a team's members, for any member.
+fn Members(c postgres.Client, who Caller, team i64) ![]MemberOut {
+	_ = try Require(c, who, team, false)
+	let rows = try c.Query("SELECT u.id, u.email, u.name, m.role FROM members m JOIN users u ON u.id = m.user_id WHERE m.team_id = {team} ORDER BY u.id")
+	mut out = []MemberOut{}
+	for r in rows.Rows {
+		out = append(out, MemberOut{User: UserOut{Id: r[0].Int(), Email: r[1].Text(), Name: r[2].Text()}, Role: r[3].Text()})
+	}
+	return out
+}
+
+// RemoveMember is an owner removing a member; the last owner cannot be removed.
+fn RemoveMember(c postgres.Client, who Caller, team i64, user i64) ! {
+	_ = try Require(c, who, team, true)
+	mut tx = try c.Begin()
+	let err = removeIn(mut tx, who, team, user)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+}
+
+fn removeIn(tx mut postgres.Tx, who Caller, team i64, user i64) ! {
+	let rows = try tx.Query("SELECT role FROM members WHERE team_id = {team} AND user_id = {user} FOR UPDATE")
+	if len(rows.Rows) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "user {user} is not a member")
+	}
+	if rows.Rows[0][0].Text() == RoleOwner {
+		let owners = try tx.Query("SELECT count(*) FROM members WHERE team_id = {team} AND role = 'owner'")
+		if owners.Rows[0][0].Int() <= 1 {
+			fail fault.Wrap(proto.ErrConflict, "the last owner cannot be removed")
+		}
+	}
+	_ = try tx.Exec("DELETE FROM members WHERE team_id = {team} AND user_id = {user}")
+	try audit(mut tx, team, who.User, who.Device, "remove", "user {user}")
+}

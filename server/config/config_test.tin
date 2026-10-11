@@ -1,0 +1,60 @@
+package config
+
+import "crucible"
+
+fn noEnv(name str) (str, bool) {
+	return "", false
+}
+
+fn runtimeEnv(name str) (str, bool) {
+	if name == "DATABASE_URL" {
+		return "postgres://avn:pw%21x@db.example.com:22115/defaultdb?sslmode=require", true
+	}
+	if name == "TINBOX_STORE" {
+		return "dir", true
+	}
+	return "", false
+}
+
+fn TestDefaults(t mut crucible.T) {
+	let c = Defaults()
+	crucible.Equal(mut t, "listen", c.Listen, ":8080")
+	crucible.Equal(mut t, "db", c.DbAddr, "127.0.0.1:5432")
+	crucible.Equal(mut t, "downloads", c.Downloads, "server")
+}
+
+fn TestDatabaseURL(t mut crucible.T) {
+	let vals = Resolve(map[str]str{}, runtimeEnv) catch err {
+		t.Error("resolve: {err}")
+		return
+	}
+	let c = Build(vals) catch err {
+		t.Error("build: {err}")
+		return
+	}
+	crucible.Equal(mut t, "addr", c.DbAddr, "db.example.com:22115")
+	crucible.Equal(mut t, "user", c.DbUser, "avn")
+	crucible.Equal(mut t, "password", reveal(c.DbPassword), "pw!x")
+	crucible.Equal(mut t, "name", c.DbName, "defaultdb")
+	crucible.Equal(mut t, "sslmode", c.DbSSLMode, "require")
+}
+
+fn TestS3Needs(t mut crucible.T) {
+	let vals = Resolve(map[str]str{}, noEnv) catch err {
+		t.Error("resolve: {err}")
+		return
+	}
+	let (_, err) = Build(vals)
+	t.HasFault("s3 without keys", err)
+}
+
+fn TestParse(t mut crucible.T) {
+	let m = ParseText("# comment\nlisten = :9000\nstore = \"dir\"\n") catch err {
+		t.Error("parse: {err}")
+		return
+	}
+	crucible.Equal(mut t, "listen", m["listen"], ":9000")
+	crucible.Equal(mut t, "store", m["store"], "dir")
+	let (_, err) = ParseText("nope = 1\n")
+	t.HasFault("unknown key", err)
+}

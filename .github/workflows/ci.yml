@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux (production)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/tinbox/tin
+          key: tin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TIN_VERSION') }}
+      - name: Unit tests and builds
+        run: scripts/test.sh
+      - name: End to end against Postgres and MinIO
+        run: tests/local.sh
+      - name: Container image
+        run: docker build -t tinbox:ci .
+
+  macos:
+    name: macOS (the Mac app's platform)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/tinbox/tin
+          key: tin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TIN_VERSION') }}
+      - name: Unit tests and builds
+        run: scripts/test.sh

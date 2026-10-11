@@ -1,0 +1,31 @@
+package store
+
+import "crucible"
+import "quarry"
+
+fn TestDirStore(t mut crucible.T) {
+	let dir = "/tmp/tin-test-tinbox-store"
+	quarry.RemoveAll(dir) catch _ {
+	}
+	let s = Open(Options{Kind: "dir", Dir: dir, Endpoint: "", Region: "", Bucket: "", AccessKey: "", SecretKey: "", PathStyle: false})
+	t.NoFault("probe", s.Probe())
+	let key = BlockKey(7, "ab")
+	t.NoFault("put", s.Put(key, "hello"))
+	let got = s.Get(key) catch err {
+		t.Error("get: {err}")
+		return
+	}
+	crucible.Equal(mut t, "get", got, "hello")
+	let objs = s.List(TeamPrefix(7)) catch err {
+		t.Error("list: {err}")
+		return
+	}
+	crucible.Equal(mut t, "list", len(objs), 1)
+	crucible.Equal(mut t, "size", objs[0].Size, 5)
+	t.NoFault("delete", s.Delete(key))
+	t.NoFault("delete again", s.Delete(key))
+	let (_, err) = s.Get(key)
+	t.HasFault("gone", err)
+	let url = s.URL(key, 60) catch _ { "x" }
+	crucible.Equal(mut t, "no url", url, "")
+}

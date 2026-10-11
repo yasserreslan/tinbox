@@ -1,0 +1,241 @@
+package proto
+
+import "fault"
+import "seal"
+import "sift"
+import "twine"
+
+// tinbox's shared format (design/backend.md): the hash layout, the text a request's signature covers, the faults the
+// API answers with, and the JSON shapes of requests and answers. The server and every client use these exact bytes.
+
+// KindDir, KindFile and KindExec are a node's kinds; the kind is part of its parent's hash.
+const KindDir = 1
+const KindFile = 2
+const KindExec = 3
+
+// BlockSize is the size of every block of a file but the last.
+const BlockSize = 4194304
+
+// MaxName is the longest name in bytes.
+const MaxName = 255
+
+// The faults the API answers with; the server maps each to its status and code.
+let ErrInvalid = fault("invalid request")
+let ErrUnauthorized = fault("unauthorized")
+let ErrNonce = fault("nonce expired")
+let ErrForbidden = fault("forbidden")
+let ErrNotFound = fault("not found")
+let ErrConflict = fault("conflict")
+let ErrTooLarge = fault("too large")
+let ErrBadBlock = fault("bad block")
+let ErrQuota = fault("quota exceeded")
+
+// Child is one entry of a directory as its hash covers it: the name, the kind and the child's hash in hex.
+type Child struct {
+	Name str
+	Kind i64
+	Hash str
+}
+
+// ValidHash reports whether h is a SHA-256 in lowercase hex.
+fn ValidHash(h str) bool {
+	if len(h) != 64 {
+		return false
+	}
+	for i in 0..len(h) {
+		let c = h[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// BlockHash is the hex SHA-256 of one block's bytes.
+fn BlockHash(data str) str {
+	return seal.Hex(seal.Sha256(data))
+}
+
+// FileHash is the SHA-256 of the block hashes' raw bytes in order; a file of no blocks hashes nothing.
+fn FileHash(blocks []str) !str {
+	mut raw = make([]u8, 0, 32 * len(blocks))
+	for b in blocks {
+		if !ValidHash(b) {
+			fail fault.Wrap(ErrInvalid, "block hash {b:q} is not 64 lowercase hex digits")
+		}
+		let bs = try seal.HexDecode(b)
+		raw = append(raw, bs...)
+	}
+	return seal.Hex(seal.Sha256(str(raw)))
+}
+
+fn byName(a Child, b Child) i64 {
+	return twine.Compare(a.Name, b.Name)
+}
+
+// DirHash is a directory's Merkle hash: SHA-256 of "tinbox dir v1\n" and, for each child in byte order of name,
+// the name, a 0 byte, the kind byte and the child's raw 32-byte hash.
+fn DirHash(children []Child) !str {
+	mut cs = sift.Clone(children)
+	sift.SortFunc(mut cs, byName)
+	mut raw = []u8("tinbox dir v1\n")
+	for c in cs {
+		raw = append(raw, []u8(c.Name)...)
+		raw = append(raw, u8(0))
+		raw = append(raw, u8(c.Kind))
+		let h = try seal.HexDecode(c.Hash)
+		if len(h) != 32 {
+			fail fault.Wrap(ErrInvalid, "the hash of {c.Name:q} is not 32 bytes")
+		}
+		raw = append(raw, h...)
+	}
+	return seal.Hex(seal.Sha256(str(raw)))
+}
+
+// EmptyDirHash is the hash of a directory with no children.
+fn EmptyDirHash() str {
+	return seal.Hex(seal.Sha256("tinbox dir v1\n"))
+}
+
+// CheckName fails unless name is a valid name for a file or directory.
+fn CheckName(name str) ! {
+	if len(name) == 0 || name == "." || name == ".." {
+		fail fault.Wrap(ErrInvalid, "the name {name:q} is not allowed")
+	}
+	if len(name) > MaxName {
+		fail fault.Wrap(ErrInvalid, "a name has at most {MaxName} bytes")
+	}
+	for i in 0..len(name) {
+		if name[i] == '/' || name[i] == 0 {
+			fail fault.Wrap(ErrInvalid, "a name cannot contain / or NUL")
+		}
+	}
+}
+
+// NameKey is the key two names collide on: macOS volumes ignore case by default, so the name in lower case.
+fn NameKey(name str) str {
+	return twine.ToLower(name)
+}
+
+// SignatureHeader is the request header that carries a signature.
+const SignatureHeader = "Tinbox-Signature"
+
+// SigningText is the bytes a request's ed25519 signature covers: the method, the target (path and query), the
+// nonce and the hex SHA-256 of the body.
+fn SigningText(method str, target str, nonce str, bodyHash str) str {
+	return "tinbox v1 " + method + " " + target + "\n" + nonce + "\n" + bodyHash + "\n"
+}
+
+// Signature is the Tinbox-Signature value: the device id (or "new" for a key not registered yet), the nonce and the
+// base64 signature.
+fn Signature(device str, nonce str, sig []u8) str {
+	return device + " " + nonce + " " + seal.B64(sig)
+}
+
+// Hash is a hex SHA-256 in a request.
+type Hash str max 64
+
+// Op is one change in a commit. Which fields count depends on op: mkdir, create, modify, move or delete.
+type Op struct {
+	@json("op_id") OpId str max 64
+	@json("op") Op str max 16
+	@json("node") Node i64
+	@json("parent") Parent i64
+	@json("parent_op") ParentOp str max 64
+	@json("name") Name str max 255
+	@json("kind") Kind i64
+	@json("blocks") Blocks []Hash max 1000000
+	@json("mtime_ns") MtimeNs i64
+	@json("base_rev") BaseRev i64
+	@json("base_place_rev") BasePlaceRev i64
+	@json("base_hash") BaseHash str max 64
+}
+
+// CommitIn is a commit's body.
+type CommitIn struct {
+	@json("ops") Ops []Op max 1000
+	@json("confirmed") Confirmed bool
+}
+
+// NodeOut is a node as the API gives it; Blocks only for a file.
+type NodeOut struct {
+	@json("id") Id i64
+	@json("parent") Parent i64
+	@json("name") Name str
+	@json("kind") Kind i64
+	@json("hash") Hash str
+	@json("size") Size i64
+	@json("mtime_ns") MtimeNs i64
+	@json("rev") Rev i64
+	@json("place_rev") PlaceRev i64
+	@json("deleted_seq") DeletedSeq i64
+	@json("blocks") Blocks []str
+}
+
+// Result is what one change of a commit did. Status is ok, conflict, missing_blocks, name_taken, not_found,
+// invalid or confirm_required.
+type Result struct {
+	@json("op_id") OpId str
+	@json("status") Status str
+	@json("node") Node i64
+	@json("rev") Rev i64
+	@json("place_rev") PlaceRev i64
+	@json("hash") Hash str
+	@json("replayed") Replayed bool
+	@json("missing") Missing []str
+	@json("message") Message str
+	@json("current") Current ?NodeOut
+}
+
+// CommitOut is a commit's answer.
+type CommitOut struct {
+	@json("results") Results []Result
+	@json("seq") Seq i64
+	@json("root_hash") RootHash str
+}
+
+// Entry is one journal row: a node's state after a change.
+type Entry struct {
+	@json("seq") Seq i64
+	@json("op") Op str
+	@json("node") Node i64
+	@json("parent") Parent i64
+	@json("name") Name str
+	@json("kind") Kind i64
+	@json("hash") Hash str
+	@json("size") Size i64
+	@json("mtime_ns") MtimeNs i64
+	@json("rev") Rev i64
+	@json("place_rev") PlaceRev i64
+	@json("deleted") Deleted bool
+	@json("device") Device i64
+	@json("blocks") Blocks []str
+}
+
+// HeadOut is a team folder's head.
+type HeadOut struct {
+	@json("seq") Seq i64
+	@json("epoch") Epoch str
+	@json("root") Root i64
+	@json("root_hash") RootHash str
+	@json("floor") Floor i64
+}
+
+// DeltaOut is a page of the journal after a cursor. Reset means the cursor is older than the journal: run the
+// Merkle walk instead.
+type DeltaOut struct {
+	@json("entries") Entries []Entry
+	@json("cursor") Cursor i64
+	@json("more") More bool
+	@json("reset") Reset bool
+	@json("epoch") Epoch str
+	@json("head") Head i64
+}
+
+// SnapshotOut is a page of a team folder's live nodes, in id order.
+type SnapshotOut struct {
+	@json("nodes") Nodes []NodeOut
+	@json("next") Next i64
+	@json("more") More bool
+	@json("seq") Seq i64
+}

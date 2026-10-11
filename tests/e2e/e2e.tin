@@ -1,0 +1,416 @@
+package main
+
+import "../../proto"
+import "argo"
+import "fault"
+import "quarry"
+import "say"
+import "seal"
+import "twine"
+import "wire"
+
+// The end-to-end check (tests/e2e.sh): a client that signs its requests as a Mac would, against a running server,
+// through joining, uploading, committing, conflicts, the Merkle check, history, the delete guard, rewind and a second
+// Mac. TINBOX_URL is the server; TINBOX_INVITE a fresh owner invite for a team of its own.
+
+type Key struct {
+	seed   []u8
+	pub    []u8
+	device str
+}
+
+type Tally struct {
+	passed i64
+	failed i64
+}
+
+fn (t mut Tally) check(label str, ok bool, detail str) {
+	if ok {
+		t.passed += 1
+		say.Line("ok   {label}")
+		return
+	}
+	t.failed += 1
+	say.Line("FAIL {label}: {detail}")
+}
+
+type NonceOut struct {
+	@json("nonce") Nonce str
+	@json("life") Life i64
+}
+
+type UserOut struct {
+	@json("id") Id i64
+	@json("email") Email str
+	@json("name") Name str
+}
+
+type Joined struct {
+	@json("user") User UserOut
+	@json("device") Device i64
+	@json("team") Team i64
+	@json("role") Role str
+}
+
+type TeamOut struct {
+	@json("id") Id i64
+	@json("name") Name str
+	@json("role") Role str
+	@json("root") Root i64
+}
+
+type MeOut struct {
+	@json("user") User UserOut
+	@json("device") Device i64
+	@json("teams") Teams []TeamOut
+}
+
+type CodeOut struct {
+	@json("code") Code str
+}
+
+type ErrorBody struct {
+	@json("code") Code str
+	@json("message") Message str
+}
+
+type ErrorOut struct {
+	@json("error") Error ErrorBody
+	@json("nonce") Nonce str
+}
+
+type MissingOut struct {
+	@json("missing") Missing []str
+}
+
+type URLsOut struct {
+	@json("urls") Urls map[str]str
+}
+
+type NodesOut struct {
+	@json("nodes") Nodes []proto.NodeOut
+}
+
+type VersionsOut struct {
+	@json("versions") Versions []VersionOut
+}
+
+type VersionOut struct {
+	@json("rev") Rev i64
+	@json("hash") Hash str
+}
+
+type RewindOut struct {
+	@json("changed") Changed i64
+	@json("seq") Seq i64
+	@json("root_hash") RootHash str
+}
+
+let base = twine.TrimRight(quarry.Getenv("TINBOX_URL"), "/")
+
+fn newKey() !Key {
+	let seed = seal.RandomBytes(32)
+	let pub = try seal.Ed25519PublicKey(seed)
+	return Key{seed: seed, pub: pub, device: "new"}
+}
+
+fn nonce() !str {
+	let r = try wire.Get(base + "/v1/nonce")
+	mut n = NonceOut{Nonce: "", Life: 0}
+	try argo.Get(r.Body, mut n)
+	return n.Nonce
+}
+
+// call sends one signed request; the path includes the query.
+fn call(k Key, method str, path str, body str) !wire.Resp {
+	let n = try nonce()
+	let text = []u8(proto.SigningText(method, path, n, seal.Hex(seal.Sha256(body))))
+	let sig = try seal.SignEd25519(k.seed, text)
+	let h = proto.Signature(k.device, n, sig)
+	return try wire.Do(method, base + path, []str{proto.SignatureHeader, h, "Content-Type", "application/json"}, body)
+}
+
+fn commit(k Key, team i64, ops str, confirmed bool) !proto.CommitOut {
+	let body = `{"ops":[` + ops + `],"confirmed":` + say.Str(confirmed) + "}}"
+	let r = try call(k, "POST", "/v1/teams/{team}/commit", body)
+	if r.Status != 200 {
+		fail "commit: {r.Status} {r.Body}"
+	}
+	mut o = proto.CommitOut{Results: []proto.Result{}, Seq: 0, RootHash: ""}
+	try argo.Get(r.Body, mut o)
+	return o
+}
+
+fn head(k Key, team i64) !proto.HeadOut {
+	let r = try call(k, "GET", "/v1/teams/{team}/head", "")
+	if r.Status != 200 {
+		fail "head: {r.Status} {r.Body}"
+	}
+	mut h = proto.HeadOut{Seq: 0, Epoch: "", Root: 0, RootHash: "", Floor: 0}
+	try argo.Get(r.Body, mut h)
+	return h
+}
+
+fn children(k Key, team i64, id i64) ![]proto.NodeOut {
+	let r = try call(k, "GET", "/v1/teams/{team}/nodes/{id}/children", "")
+	if r.Status != 200 {
+		fail "children: {r.Status} {r.Body}"
+	}
+	mut o = NodesOut{Nodes: []proto.NodeOut{}}
+	try argo.Get(r.Body, mut o)
+	return o.Nodes
+}
+
+fn upload(k Key, team i64, data str) !str {
+	let h = proto.BlockHash(data)
+	let r = try call(k, "PUT", "/v1/teams/{team}/blocks/{h}", data)
+	if r.Status != 200 {
+		fail "upload: {r.Status} {r.Body}"
+	}
+	return h
+}
+
+fn quote(s str) str {
+	mut b = make([]u8, 0, len(s) + 2)
+	argo.Str(mut b, s)
+	return str(b)
+}
+
+fn mkdirOp(id str, parent i64, parentOp str, name str) str {
+	return `{"op_id":` + quote(id) + `,"op":"mkdir","parent":` + say.Str(parent) + `,"parent_op":` + quote(parentOp) + `,"name":` + quote(name) + "}}"
+}
+
+fn createOp(id str, parent i64, parentOp str, name str, blocks []str) str {
+	mut bs = []str{}
+	for b in blocks {
+		bs = append(bs, quote(b))
+	}
+	return `{"op_id":` + quote(id) + `,"op":"create","parent":` + say.Str(parent) + `,"parent_op":` + quote(parentOp) + `,"name":` + quote(name) + `,"kind":2,"blocks":[` + twine.Join(bs, ",") + "]}}"
+}
+
+fn byName(nodes []proto.NodeOut, name str) ?proto.NodeOut {
+	for n in nodes {
+		if n.Name == name {
+			return n
+		}
+	}
+	return nil
+}
+
+fn statuses(o proto.CommitOut) str {
+	mut ss = []str{}
+	for r in o.Results {
+		ss = append(ss, r.Status)
+	}
+	return twine.Join(ss, ",")
+}
+
+fn run(t mut Tally) ! {
+	let code = quarry.Getenv("TINBOX_INVITE")
+	mut a = try newKey()
+	// 1. join with the invite
+	let acceptBody = `{"code":` + quote(code) + `,"name":"Me","device_name":"MacBook Pro","public_key":` + quote(seal.B64(a.pub)) + "}}"
+	let j = try call(a, "POST", "/v1/invites/accept", acceptBody)
+	t.check("accept invite", j.Status == 201, "{j.Status} {j.Body}")
+	mut joined = Joined{User: UserOut{Id: 0, Email: "", Name: ""}, Device: 0, Team: 0, Role: ""}
+	try argo.Get(j.Body, mut joined)
+	a.device = say.Str(joined.Device)
+	let team = joined.Team
+	t.check("owner", joined.Role == "owner", joined.Role)
+	let late = try newKey()
+	let lateBody = `{"code":` + quote(code) + `,"name":"Me","device_name":"Another Mac","public_key":` + quote(seal.B64(late.pub)) + "}}"
+	let again = try call(late, "POST", "/v1/invites/accept", lateBody)
+	t.check("an invite works once", again.Status == 404, "{again.Status}")
+	// 2. me
+	let m = try call(a, "GET", "/v1/me", "")
+	mut me = MeOut{User: UserOut{Id: 0, Email: "", Name: ""}, Device: 0, Teams: []TeamOut{}}
+	try argo.Get(m.Body, mut me)
+	t.check("me", m.Status == 200 && len(me.Teams) == 1 && me.Teams[0].Id == team, m.Body)
+	// 3. head
+	let h0 = try head(a, team)
+	let root = h0.Root
+	t.check("empty folder", h0.Seq == 0 && h0.RootHash == proto.EmptyDirHash(), "{h0.Seq} {h0.RootHash}")
+	// 4. unsigned
+	let bare = try wire.Get(base + "/v1/teams/{team}/head")
+	mut e = ErrorOut{Error: ErrorBody{Code: "", Message: ""}, Nonce: ""}
+	argo.Get(bare.Body, mut e) catch _ {
+	}
+	t.check("unsigned is 401 with a nonce", bare.Status == 401 && len(e.Nonce) > 0 && e.Error.Code == "Unauthorized", "{bare.Status} {bare.Body}")
+	// 5. blocks
+	let content1 = "hello tinbox\n"
+	let h1 = proto.BlockHash(content1)
+	let miss = try call(a, "POST", "/v1/teams/{team}/blocks/missing", `{"hashes":[` + quote(h1) + "]}}")
+	t.check("missing before upload", twine.Contains(miss.Body, h1), miss.Body)
+	let otherHash = proto.BlockHash("other")
+	let wrong = try call(a, "PUT", "/v1/teams/{team}/blocks/{otherHash}", content1)
+	t.check("a block under the wrong hash is refused", wrong.Status == 422, "{wrong.Status} {wrong.Body}")
+	_ = try upload(a, team, content1)
+	let miss2 = try call(a, "POST", "/v1/teams/{team}/blocks/missing", `{"hashes":[` + quote(h1) + "]}}")
+	t.check("nothing missing after upload", miss2.Body == `{"missing":[]}`, miss2.Body)
+	// 6. a batch with a folder made in the same batch
+	let batch = mkdirOp("d1", root, "", "Docs") + "," + createOp("f1", 0, "d1", "hello.txt", []str{h1}) + "," + createOp("f2", root, "", "empty.txt", []str{})
+	let c1 = try commit(a, team, batch, false)
+	t.check("first commit", statuses(c1) == "ok,ok,ok", statuses(c1))
+	let s6 = c1.Seq
+	// 7. the same batch again changes nothing
+	let c2 = try commit(a, team, batch, false)
+	t.check("a retried batch is replayed", c2.Results[0].Replayed && c2.Results[1].Replayed && c2.Seq == s6, "{c2.Seq} vs {s6}")
+	// 8. delta
+	let d = try call(a, "GET", "/v1/teams/{team}/delta?cursor=0", "")
+	mut dl = proto.DeltaOut{Entries: []proto.Entry{}, Cursor: 0, More: false, Reset: false, Epoch: "", Head: 0}
+	try argo.Get(d.Body, mut dl)
+	t.check("delta", len(dl.Entries) == 3 && dl.Cursor == s6 && len(dl.Entries[1].Blocks) == 1, d.Body)
+	// 9. the Merkle check: the root hash the server keeps is the one computed here
+	let fileHash = try proto.FileHash([]str{h1})
+	let docsHash = try proto.DirHash([]proto.Child{proto.Child{Name: "hello.txt", Kind: proto.KindFile, Hash: fileHash}})
+	let emptyHash = try proto.FileHash([]str{})
+	let rootHash = try proto.DirHash([]proto.Child{proto.Child{Name: "Docs", Kind: proto.KindDir, Hash: docsHash}, proto.Child{Name: "empty.txt", Kind: proto.KindFile, Hash: emptyHash}})
+	t.check("root hash matches the client's", c1.RootHash == rootHash, "{c1.RootHash} vs {rootHash}")
+	// 10. children
+	let kids = try children(a, team, root)
+	t.check("children", len(kids) == 2, "{len(kids)}")
+	let docsId = c1.Results[0].Node
+	let helloId = c1.Results[1].Node
+	let helloRev = c1.Results[1].Rev
+	// 11. a stale edit is a conflict that carries the current state
+	let content2 = "hello again\n"
+	let h2 = try upload(a, team, content2)
+	let stale = try commit(a, team, `{"op_id":"m0","op":"modify","node":` + say.Str(helloId) + `,"base_rev":1,"blocks":[` + quote(h2) + "]}}", false)
+	let cur = stale.Results[0].Current
+	t.check("stale edit is a conflict", stale.Results[0].Status == "conflict" && cur != nil, statuses(stale))
+	// 12. an edit on the right base
+	let edit = try commit(a, team, `{"op_id":"m1","op":"modify","node":` + say.Str(helloId) + `,"base_rev":` + say.Str(helloRev) + `,"blocks":[` + quote(h2) + "]}}", false)
+	t.check("edit", edit.Results[0].Status == "ok", statuses(edit))
+	let vs = try call(a, "GET", "/v1/teams/{team}/nodes/{helloId}/versions", "")
+	mut vo = VersionsOut{Versions: []VersionOut{}}
+	try argo.Get(vs.Body, mut vo)
+	t.check("two versions", len(vo.Versions) == 2, vs.Body)
+	// 13. names: case-insensitive collisions
+	let clash = try commit(a, team, createOp("f3", docsId, "", "HELLO.TXT", []str{}), false)
+	t.check("names collide ignoring case", clash.Results[0].Status == "name_taken", statuses(clash))
+	let ren = try commit(a, team, `{"op_id":"mv1","op":"move","node":` + say.Str(helloId) + `,"base_place_rev":` + say.Str(c1.Results[1].PlaceRev) + `,"name":"Hello.txt"}`, false)
+	t.check("rename", ren.Results[0].Status == "ok", statuses(ren))
+	// 14. a folder cannot move inside itself
+	let sub = try commit(a, team, mkdirOp("sub", docsId, "", "Sub"), false)
+	let subId = sub.Results[0].Node
+	let loop = try commit(a, team, `{"op_id":"mv2","op":"move","node":` + say.Str(docsId) + `,"base_place_rev":` + say.Str(c1.Results[0].PlaceRev) + `,"parent":` + say.Str(subId) + "}}", false)
+	t.check("a folder cannot move inside itself", loop.Results[0].Status == "invalid", statuses(loop))
+	// 15. deleting a folder checks its hash
+	let badDel = try commit(a, team, `{"op_id":"del0","op":"delete","node":` + say.Str(docsId) + `,"base_hash":` + quote(docsHash) + "}}", false)
+	t.check("deleting a changed folder is a conflict", badDel.Results[0].Status == "conflict", statuses(badDel))
+	let rootKids = try children(a, team, root)
+	let docsNow = byName(rootKids, "Docs")
+	mut nowHash = ""
+	if docsNow != nil {
+		nowHash = docsNow.Hash
+	}
+	let del = try commit(a, team, `{"op_id":"del1","op":"delete","node":` + say.Str(docsId) + `,"base_hash":` + quote(nowHash) + "}}", false)
+	t.check("delete a folder", del.Results[0].Status == "ok", statuses(del))
+	let tr = try call(a, "GET", "/v1/teams/{team}/trash", "")
+	t.check("trash", twine.Contains(tr.Body, `"Docs"`), tr.Body)
+	// 16. restore
+	let rs = try call(a, "POST", "/v1/teams/{team}/nodes/{docsId}/restore", "")
+	let restoredKids = try children(a, team, root)
+	t.check("restore", rs.Status == 200 && byName(restoredKids, "Docs") != nil, rs.Body)
+	let docsKids = try children(a, team, docsId)
+	t.check("restore brings back what was inside", len(docsKids) == 2, "{len(docsKids)}")
+	// 17. another Mac of mine, by device link
+	mut b = try newKey()
+	let lk = try call(b, "POST", "/v1/links", `{"device_name":"MacBook Air","public_key":` + quote(seal.B64(b.pub)) + "}}")
+	mut lc = CodeOut{Code: ""}
+	try argo.Get(lk.Body, mut lc)
+	t.check("start a link", lk.Status == 201 && len(lc.Code) == 9, lk.Body)
+	let early = try call(b, "POST", "/v1/links/claim", `{"code":` + quote(lc.Code) + `,"public_key":` + quote(seal.B64(b.pub)) + "}}")
+	t.check("an unapproved link cannot be claimed", early.Status == 409, "{early.Status} {early.Body}")
+	let ap = try call(a, "POST", "/v1/links/approve", `{"code":` + quote(twine.ToLower(lc.Code)) + "}}")
+	t.check("approve the link", ap.Status == 200 && twine.Contains(ap.Body, "MacBook Air"), ap.Body)
+	let cl = try call(b, "POST", "/v1/links/claim", `{"code":` + quote(lc.Code) + `,"public_key":` + quote(seal.B64(b.pub)) + "}}")
+	mut bj = Joined{User: UserOut{Id: 0, Email: "", Name: ""}, Device: 0, Team: 0, Role: ""}
+	try argo.Get(cl.Body, mut bj)
+	b.device = say.Str(bj.Device)
+	t.check("claim the link", cl.Status == 201 && bj.User.Id == joined.User.Id, cl.Body)
+	let hb = try head(b, team)
+	t.check("the second Mac sees the folder", hb.Seq > 0, "{hb.Seq}")
+	// 18. a member
+	let inv = try call(a, "POST", "/v1/teams/{team}/invites", `{"email":"friend@example.com","role":"member"}`)
+	mut ic = CodeOut{Code: ""}
+	try argo.Get(inv.Body, mut ic)
+	t.check("invite a member", inv.Status == 201 && twine.HasPrefix(ic.Code, "TBI-"), inv.Body)
+	mut f = try newKey()
+	let fj = try call(f, "POST", "/v1/invites/accept", `{"code":` + quote(ic.Code) + `,"name":"","device_name":"Friend's Mac","public_key":` + quote(seal.B64(f.pub)) + "}}")
+	mut fjo = Joined{User: UserOut{Id: 0, Email: "", Name: ""}, Device: 0, Team: 0, Role: ""}
+	try argo.Get(fj.Body, mut fjo)
+	f.device = say.Str(fjo.Device)
+	t.check("the member joins", fj.Status == 201 && fjo.Role == "member" && fjo.User.Name == "friend", fj.Body)
+	let fr = try call(f, "POST", "/v1/teams/{team}/rewind", `{"seq":1}`)
+	t.check("a member cannot rewind", fr.Status == 403, "{fr.Status}")
+	let fc = try commit(f, team, mkdirOp("fdir", root, "", "From a friend"), false)
+	t.check("a member changes files", fc.Results[0].Status == "ok", statuses(fc))
+	// 19. the mass-delete guard
+	mut bulk = mkdirOp("bulk", root, "", "Bulk")
+	for i in 0..60 {
+		bulk = bulk + "," + createOp("bulk-{i}", 0, "bulk", "file-{i}.txt", []str{})
+	}
+	let cb = try commit(a, team, bulk, false)
+	let bulkId = cb.Results[0].Node
+	let bulkKids = try children(a, team, root)
+	let bulkNow = byName(bulkKids, "Bulk")
+	mut bulkHash = ""
+	if bulkNow != nil {
+		bulkHash = bulkNow.Hash
+	}
+	let gd = try commit(a, team, `{"op_id":"bulk-del","op":"delete","node":` + say.Str(bulkId) + `,"base_hash":` + quote(bulkHash) + "}}", false)
+	t.check("deleting most of the folder needs confirmation", gd.Results[0].Status == "confirm_required", statuses(gd))
+	let gd2 = try commit(a, team, `{"op_id":"bulk-del2","op":"delete","node":` + say.Str(bulkId) + `,"base_hash":` + quote(bulkHash) + "}}", true)
+	t.check("confirmed, it deletes", gd2.Results[0].Status == "ok", statuses(gd2))
+	// 20. rewind to just after the first commit: the folder is exactly as it was then
+	let rw = try call(a, "POST", "/v1/teams/{team}/rewind", `{"seq":` + say.Str(s6) + "}}")
+	mut ro = RewindOut{Changed: 0, Seq: 0, RootHash: ""}
+	try argo.Get(rw.Body, mut ro)
+	t.check("rewind", rw.Status == 200 && ro.Changed > 0, rw.Body)
+	t.check("after the rewind the root hash is the first commit's", ro.RootHash == rootHash, "{ro.RootHash} vs {rootHash}")
+	let ch = try call(a, "GET", "/v1/teams/{team}/nodes/{helloId}", "")
+	mut hn = proto.NodeOut{Id: 0, Parent: 0, Name: "", Kind: 0, Hash: "", Size: 0, MtimeNs: 0, Rev: 0, PlaceRev: 0, DeletedSeq: 0, Blocks: []str{}}
+	try argo.Get(ch.Body, mut hn)
+	t.check("the file's name and content are back", hn.Name == "hello.txt" && hn.Hash == fileHash && hn.Parent == docsId, ch.Body)
+	// 21. downloads
+	let u = try call(a, "POST", "/v1/teams/{team}/blocks/urls", `{"hashes":[` + quote(h1) + "]}}")
+	mut uo = URLsOut{Urls: map[str]str{}}
+	try argo.Get(u.Body, mut uo)
+	let link = uo.Urls[h1]
+	t.check("a download URL", len(link) > 0, u.Body)
+	mut got = ""
+	if twine.HasPrefix(link, "/") || twine.HasPrefix(link, base) {
+		let path = twine.TrimPrefix(link, base)
+		let dl2 = try call(a, "GET", path, "")
+		got = dl2.Body
+	} else {
+		let dl3 = try wire.Get(link)
+		got = dl3.Body
+	}
+	t.check("the block downloads intact", got == content1, "{len(got)} bytes")
+	// 22. wait answers at once when the head moved
+	let wt = try call(a, "GET", "/v1/teams/{team}/wait?cursor=0", "")
+	t.check("wait", wt.Status == 200 && twine.Contains(wt.Body, `"seq"`), wt.Body)
+	// 23. a revoked Mac is refused
+	let rv = try call(a, "DELETE", "/v1/devices/{b.device}", "")
+	t.check("revoke the second Mac", rv.Status == 200, rv.Body)
+	let after = try call(b, "GET", "/v1/teams/{team}/head", "")
+	t.check("a revoked Mac is refused", after.Status == 401, "{after.Status}")
+}
+
+fn main() {
+	if len(base) == 0 || len(quarry.Getenv("TINBOX_INVITE")) == 0 {
+		quarry.Eprintln("e2e: set TINBOX_URL and TINBOX_INVITE")
+		quarry.Exit(2)
+	}
+	mut t = Tally{passed: 0, failed: 0}
+	run(mut t) catch err {
+		t.failed += 1
+		say.Line("FAIL stopped: {fault.Message(err)}")
+	}
+	say.Line("{t.passed} passed, {t.failed} failed")
+	if t.failed > 0 {
+		quarry.Exit(1)
+	}
+}

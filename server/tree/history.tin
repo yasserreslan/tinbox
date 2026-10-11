@@ -1,0 +1,284 @@
+package tree
+
+import "../../proto"
+import "fault"
+import "postgres"
+import "seal"
+
+// History (design/backend.md, "When things break"): nothing is gone for history.days. A file's versions and the
+// trash come back with Restore, and an owner puts the whole folder back as it was at a seq with Rewind. Both write new
+// changes, so they sync like any other and can be undone the same way.
+
+// VersionOut is one version of a file.
+type VersionOut struct {
+	@json("rev") Rev i64
+	@json("kind") Kind i64
+	@json("hash") Hash str
+	@json("size") Size i64
+	@json("device") Device i64
+	@json("at") At i64
+}
+
+// RewindOut is what a rewind did.
+type RewindOut struct {
+	@json("changed") Changed i64
+	@json("seq") Seq i64
+	@json("root_hash") RootHash str
+}
+
+// Versions is a file's versions, newest first.
+fn Versions(c postgres.Client, team i64, id i64) ![]VersionOut {
+	let n = try Get(c, team, id)
+	if n.Kind == proto.KindDir {
+		fail fault.Wrap(proto.ErrInvalid, "node {id} is a folder: folders have no versions")
+	}
+	let rows = try c.Query("SELECT rev, kind, hash, size, coalesce(device_id, 0), extract(epoch FROM created_at)::bigint FROM versions WHERE team_id = {team} AND node_id = {id} ORDER BY rev DESC")
+	mut out = []VersionOut{}
+	for r in rows.Rows {
+		out = append(out, VersionOut{Rev: r[0].Int(), Kind: r[1].Int(), Hash: r[2].Text(), Size: r[3].Int(), Device: r[4].Int(), At: r[5].Int()})
+	}
+	return out
+}
+
+// Trash is what was deleted and not purged yet: the top of each deletion, newest first.
+fn Trash(c postgres.Client, team i64) ![]proto.NodeOut {
+	let rows = try c.Query("SELECT n.id, coalesce(n.parent_id, 0), n.name, n.kind, n.hash, n.size, n.mtime_ns, n.rev, n.place_rev, n.deleted_seq, '' FROM nodes n WHERE n.team_id = {team} AND n.deleted_seq IS NOT NULL AND NOT EXISTS (SELECT 1 FROM nodes p WHERE p.team_id = n.team_id AND p.id = n.parent_id AND p.deleted_seq = n.deleted_seq) ORDER BY n.deleted_seq DESC, n.id LIMIT 1000")
+	return nodeRows(rows)
+}
+
+fn internalOp(kind str) str {
+	return kind + ":" + seal.Hex(seal.RandomBytes(8))
+}
+
+// freeName is name, or name with " (restored)" (then a number) when a live node of the directory holds it.
+fn freeName(tx mut postgres.Tx, team i64, parent i64, name str, except i64) !str {
+	mut candidate = name
+	mut n = 1
+	for {
+		let other = try taken(mut tx, team, parent, candidate, except)
+		if other == 0 {
+			return candidate
+		}
+		candidate = match n {
+			1 => name + " (restored)"
+			_ => name + " (restored {n})"
+		}
+		n += 1
+	}
+	return candidate
+}
+
+// Restore brings back a node from the trash (with what was deleted along with it) and, for a file given rev > 0,
+// that version's content, as new changes by device.
+fn Restore(c postgres.Client, team i64, device i64, id i64, rev i64) !proto.Result {
+	mut tx = try c.Begin()
+	let (r, err) = restoreIn(mut tx, team, device, id, rev)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+	return r
+}
+
+fn restoreIn(tx mut postgres.Tx, team i64, device i64, id i64, rev i64) !proto.Result {
+	try lockTeam(mut tx, team)
+	let t = try tx.Query("SELECT head_seq, root_id FROM teams WHERE id = {team}")
+	mut st = state{team: team, device: device, seq: t.Rows[0][0].Int(), created: map[str]i64{}, dirty: map[i64]bool{}}
+	let rootId = t.Rows[0][1].Int()
+	let opId = internalOp("restore")
+	let got = try loadIn(mut tx, team, id)
+	if got == nil {
+		fail fault.Wrap(proto.ErrNotFound, "no node {id}")
+	}
+	mut n = got
+	if n.DeletedSeq != 0 {
+		let mark = n.DeletedSeq
+		mut parent = n.Parent
+		let dir = try liveDir(mut tx, team, parent)
+		if dir == nil {
+			parent = rootId
+		}
+		let name = try freeName(mut tx, team, parent, n.Name, n.Id)
+		let group = try tx.Query("WITH RECURSIVE down(id, depth) AS (SELECT id, 0 FROM nodes WHERE team_id = {team} AND id = {id} UNION ALL SELECT n.id, down.depth + 1 FROM nodes n JOIN down ON n.parent_id = down.id WHERE n.team_id = {team} AND n.deleted_seq = {mark}) SELECT n.id, coalesce(n.parent_id, 0), n.name, n.kind, n.hash, n.size, n.mtime_ns, n.rev, n.place_rev, 0 FROM down d JOIN nodes n ON n.team_id = {team} AND n.id = d.id ORDER BY d.depth, n.id")
+		for r in group.Rows {
+			mut g = scan(r)
+			let seq = nextSeq(mut st)
+			if g.Id == id {
+				g.Parent = parent
+				g.Name = name
+				g.PlaceRev = seq
+				let key = proto.NameKey(name)
+				_ = try tx.Exec("UPDATE nodes SET deleted_seq = NULL, parent_id = {parent}, name = {name}, name_key = {key}, place_rev = {seq} WHERE team_id = {team} AND id = {id}")
+				n = g
+			} else {
+				_ = try tx.Exec("UPDATE nodes SET deleted_seq = NULL WHERE team_id = {team} AND id = {g.Id}")
+			}
+			try record(mut tx, st, opId, "restore", g, seq)
+		}
+		st.dirty[parent] = true
+	}
+	if rev > 0 && n.Kind != proto.KindDir && rev != n.Rev {
+		let v = try tx.Query("SELECT kind, hash, size FROM versions WHERE team_id = {team} AND node_id = {id} AND rev = {rev}")
+		if len(v.Rows) == 0 {
+			fail fault.Wrap(proto.ErrNotFound, "node {id} has no version {rev} (it may have been purged)")
+		}
+		let seq = nextSeq(mut st)
+		let m = Node{Id: n.Id, Parent: n.Parent, Name: n.Name, Kind: v.Rows[0][0].Int(), Hash: v.Rows[0][1].Text(), Size: v.Rows[0][2].Int(), MtimeNs: n.MtimeNs, Rev: seq, PlaceRev: n.PlaceRev, DeletedSeq: 0}
+		_ = try tx.Exec("UPDATE nodes SET kind = {m.Kind}, hash = {m.Hash}, size = {m.Size}, rev = {seq} WHERE team_id = {team} AND id = {id}")
+		try copyVersion(mut tx, team, device, m, rev)
+		try record(mut tx, st, opId, "restore", m, seq)
+		st.dirty[n.Parent] = true
+		n = m
+	}
+	let root = try rehash(mut tx, team, st.dirty)
+	let seq = st.seq
+	_ = try tx.Exec("UPDATE teams SET head_seq = {seq} WHERE id = {team}")
+	let after = try loadIn(mut tx, team, id)
+	mut r = proto.Result{OpId: opId, Status: "ok", Node: id, Rev: n.Rev, PlaceRev: n.PlaceRev, Hash: n.Hash, Replayed: false, Missing: []str{}, Message: "", Current: nil}
+	if after != nil {
+		r.Hash = after.Hash
+		r.Current = try current(mut tx, team, after)
+	}
+	r.Message = "root {root}"
+	return r
+}
+
+// target is a node's state at a seq, from its last journal row at or before it.
+type target struct {
+	exists bool
+	n      Node
+}
+
+// Rewind puts the team's folder back as it was at seq: every node changed since is set to its state then, as new
+// changes by device. seq must not be below the journal's floor.
+fn Rewind(c postgres.Client, team i64, device i64, seq i64) !RewindOut {
+	mut tx = try c.Begin()
+	let (r, err) = rewindIn(mut tx, team, device, seq)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+	return r
+}
+
+fn rewindIn(tx mut postgres.Tx, team i64, device i64, to i64) !RewindOut {
+	try lockTeam(mut tx, team)
+	let t = try tx.Query("SELECT head_seq, root_id, floor_seq FROM teams WHERE id = {team}")
+	let head = t.Rows[0][0].Int()
+	let rootId = t.Rows[0][1].Int()
+	let floor = t.Rows[0][2].Int()
+	if to < floor || to > head {
+		fail fault.Wrap(proto.ErrInvalid, "seq {to} is outside the history kept: {floor} to {head}")
+	}
+	mut st = state{team: team, device: device, seq: head, created: map[str]i64{}, dirty: map[i64]bool{}}
+	if to == head {
+		let h = try tx.Query("SELECT root_hash FROM teams WHERE id = {team}")
+		return RewindOut{Changed: 0, Seq: head, RootHash: h.Rows[0][0].Text()}
+	}
+	let opId = internalOp("rewind")
+	// every node changed after the seq, and its state then
+	let changed = try tx.Query("SELECT DISTINCT node_id FROM journal WHERE team_id = {team} AND seq > {to} AND node_id <> {rootId}")
+	mut targets = map[i64]target{}
+	mut order = []i64{}
+	for r in changed.Rows {
+		let id = r[0].Int()
+		let past = try tx.Query("SELECT node_id, coalesce(parent_id, 0), name, kind, hash, size, mtime_ns, rev, place_rev, CASE WHEN deleted THEN 1 ELSE 0 END FROM journal WHERE team_id = {team} AND node_id = {id} AND seq <= {to} ORDER BY seq DESC LIMIT 1")
+		if len(past.Rows) == 0 {
+			targets[id] = target{exists: false, n: Node{Id: id, Parent: 0, Name: "", Kind: 0, Hash: "", Size: 0, MtimeNs: 0, Rev: 0, PlaceRev: 0, DeletedSeq: 0}}
+		} else {
+			let p = scan(past.Rows[0])
+			targets[id] = target{exists: p.DeletedSeq == 0, n: p}
+		}
+		order = append(order, id)
+	}
+	// set the affected live nodes aside (deleted_seq -1) so names are free, then put back what existed, parents first
+	mut before = map[i64]Node{}
+	for id in order {
+		let got = try loadIn(mut tx, team, id)
+		if got != nil {
+			let cur = got
+			before[id] = cur
+			if cur.DeletedSeq == 0 {
+				st.dirty[cur.Parent] = true
+			}
+			_ = try tx.Exec("UPDATE nodes SET deleted_seq = -1 WHERE team_id = {team} AND id = {id} AND deleted_seq IS NULL")
+		}
+	}
+	mut placed = map[i64]bool{}
+	mut changedCount = 0
+	mut progress = true
+	for progress {
+		progress = false
+		for id in order {
+			let tg = targets[id]
+			if !tg.exists || placed[id] {
+				continue
+			}
+			let (_, known) = before[id]
+			if !known {
+				// a node purged since: nothing to put back
+				placed[id] = true
+				continue
+			}
+			mut parent = tg.n.Parent
+			let (ptg, parentAffected) = targets[parent]
+			if parentAffected && ptg.exists && !placed[parent] {
+				continue
+			}
+			let dir = try liveDir(mut tx, team, parent)
+			if dir == nil {
+				parent = rootId
+			}
+			let name = try freeName(mut tx, team, parent, tg.n.Name, id)
+			let seq = nextSeq(mut st)
+			let was = before[id]
+			mut m = Node{Id: id, Parent: parent, Name: name, Kind: tg.n.Kind, Hash: tg.n.Hash, Size: tg.n.Size, MtimeNs: tg.n.MtimeNs, Rev: was.Rev, PlaceRev: seq, DeletedSeq: 0}
+			let key = proto.NameKey(name)
+			if m.Kind != proto.KindDir && tg.n.Hash != was.Hash {
+				let v = try tx.Query("SELECT 1 FROM versions WHERE team_id = {team} AND node_id = {id} AND rev = {tg.n.Rev}")
+				if len(v.Rows) == 1 {
+					m.Rev = seq
+					try copyVersion(mut tx, team, device, m, tg.n.Rev)
+				} else {
+					m.Kind = was.Kind
+					m.Hash = was.Hash
+					m.Size = was.Size
+				}
+			}
+			if m.Kind == proto.KindDir {
+				m.Hash = was.Hash
+			}
+			_ = try tx.Exec("UPDATE nodes SET deleted_seq = NULL, parent_id = {parent}, name = {name}, name_key = {key}, kind = {m.Kind}, hash = {m.Hash}, size = {m.Size}, mtime_ns = {m.MtimeNs}, rev = {m.Rev}, place_rev = {seq} WHERE team_id = {team} AND id = {id}")
+			try record(mut tx, st, opId, "rewind", m, seq)
+			st.dirty[parent] = true
+			if m.Kind == proto.KindDir {
+				st.dirty[id] = true
+			}
+			placed[id] = true
+			changedCount += 1
+			progress = true
+		}
+	}
+	// what did not exist then and is still set aside goes to the trash
+	for id in order {
+		let got = try loadIn(mut tx, team, id)
+		if got == nil {
+			continue
+		}
+		let cur = got
+		if cur.DeletedSeq != -1 {
+			continue
+		}
+		let seq = nextSeq(mut st)
+		_ = try tx.Exec("UPDATE nodes SET deleted_seq = {seq} WHERE team_id = {team} AND id = {id}")
+		let gone = Node{Id: cur.Id, Parent: cur.Parent, Name: cur.Name, Kind: cur.Kind, Hash: cur.Hash, Size: cur.Size, MtimeNs: cur.MtimeNs, Rev: cur.Rev, PlaceRev: cur.PlaceRev, DeletedSeq: seq}
+		try record(mut tx, st, opId, "delete", gone, seq)
+		changedCount += 1
+	}
+	let root = try rehash(mut tx, team, st.dirty)
+	let seq = st.seq
+	_ = try tx.Exec("UPDATE teams SET head_seq = {seq} WHERE id = {team}")
+	return RewindOut{Changed: changedCount, Seq: seq, RootHash: root}
+}

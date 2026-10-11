@@ -1,0 +1,468 @@
+package tree
+
+import "../../proto"
+import "fault"
+import "postgres"
+import "twine"
+
+// A commit (design/backend.md, "Committing changes"): a batch of changes applied in order under the team's lock, each
+// checked against the base the client last saw. A change that was applied before (its op_id is in the journal)
+// answers with its first result, so a retry after a lost answer changes nothing.
+
+// GuardFiles and GuardMin are the mass-delete guard: a batch deleting more than GuardFiles files, or more than a
+// quarter of the folder once it deletes more than GuardMin, needs "confirmed": true.
+const GuardFiles = 500
+const GuardMin = 50
+
+// state is one commit's working set.
+type state struct {
+	team    i64
+	device  i64
+	seq     i64
+	created map[str]i64
+	dirty   map[i64]bool
+}
+
+fn nextSeq(st mut state) i64 {
+	st.seq += 1
+	return st.seq
+}
+
+fn status(op proto.Op, s str, message str) proto.Result {
+	return proto.Result{OpId: op.OpId, Status: s, Node: op.Node, Rev: 0, PlaceRev: 0, Hash: "", Replayed: false, Missing: []str{}, Message: message, Current: nil}
+}
+
+fn okResult(op proto.Op, n Node) proto.Result {
+	return proto.Result{OpId: op.OpId, Status: "ok", Node: n.Id, Rev: n.Rev, PlaceRev: n.PlaceRev, Hash: n.Hash, Replayed: false, Missing: []str{}, Message: "", Current: nil}
+}
+
+fn conflict(tx mut postgres.Tx, team i64, op proto.Op, n Node, message str) !proto.Result {
+	mut r = status(op, "conflict", message)
+	r.Node = n.Id
+	r.Current = try current(mut tx, team, n)
+	return r
+}
+
+// record appends a node's new state to the journal at seq.
+fn record(tx mut postgres.Tx, st state, opId str, op str, n Node, seq i64) ! {
+	let team = st.team
+	let device = st.device
+	let deleted = n.DeletedSeq != 0
+	_ = try tx.Exec("INSERT INTO journal (team_id, seq, op_id, node_id, op, parent_id, name, kind, hash, size, mtime_ns, rev, place_rev, deleted, device_id) VALUES ({team}, {seq}, {opId}, {n.Id}, {op}, nullif({n.Parent}, 0), {n.Name}, {n.Kind}, {n.Hash}, {n.Size}, {n.MtimeNs}, {n.Rev}, {n.PlaceRev}, {deleted}, nullif({device}, 0))")
+}
+
+// addVersion records a file's content at rev, with its blocks in order.
+fn addVersion(tx mut postgres.Tx, team i64, device i64, n Node, blocks []str) ! {
+	_ = try tx.Exec("INSERT INTO versions (team_id, node_id, rev, kind, hash, size, device_id) VALUES ({team}, {n.Id}, {n.Rev}, {n.Kind}, {n.Hash}, {n.Size}, nullif({device}, 0))")
+	if len(blocks) == 0 {
+		return
+	}
+	let csv = twine.Join(blocks, ",")
+	_ = try tx.Exec("INSERT INTO version_blocks (team_id, node_id, rev, idx, hash) SELECT {team}, {n.Id}, {n.Rev}, (u.ord - 1)::int, u.h FROM unnest(string_to_array({csv}, ',')) WITH ORDINALITY AS u(h, ord)")
+}
+
+// copyVersion records a file's content at rev as a copy of an older version's blocks.
+fn copyVersion(tx mut postgres.Tx, team i64, device i64, n Node, fromRev i64) ! {
+	_ = try tx.Exec("INSERT INTO versions (team_id, node_id, rev, kind, hash, size, device_id) VALUES ({team}, {n.Id}, {n.Rev}, {n.Kind}, {n.Hash}, {n.Size}, nullif({device}, 0))")
+	_ = try tx.Exec("INSERT INTO version_blocks (team_id, node_id, rev, idx, hash) SELECT team_id, node_id, {n.Rev}, idx, hash FROM version_blocks WHERE team_id = {team} AND node_id = {n.Id} AND rev = {fromRev}")
+}
+
+// liveDir is a live directory of the team, nil when id is not one.
+fn liveDir(tx mut postgres.Tx, team i64, id i64) !?Node {
+	if id <= 0 {
+		return nil
+	}
+	let got = try loadIn(mut tx, team, id)
+	if got == nil {
+		return nil
+	}
+	let n = got
+	if n.Kind != proto.KindDir || n.DeletedSeq != 0 {
+		return nil
+	}
+	return n
+}
+
+// taken is the live node holding name in a directory, other than except, or 0.
+fn taken(tx mut postgres.Tx, team i64, parent i64, name str, except i64) !i64 {
+	let key = proto.NameKey(name)
+	let rows = try tx.Query("SELECT id FROM nodes WHERE team_id = {team} AND parent_id = {parent} AND name_key = {key} AND deleted_seq IS NULL AND id <> {except}")
+	if len(rows.Rows) == 0 {
+		return 0
+	}
+	return rows.Rows[0][0].Int()
+}
+
+// blockInfo is which of a file's blocks the team lacks, and the file's size from the blocks it has.
+fn blockInfo(tx mut postgres.Tx, team i64, blocks []str) !([]str, i64) {
+	mut missing = []str{}
+	if len(blocks) == 0 {
+		return missing, 0
+	}
+	for b in blocks {
+		if !proto.ValidHash(b) {
+			fail fault.Wrap(proto.ErrInvalid, "block {b:q} is not a hex SHA-256")
+		}
+	}
+	let csv = twine.Join(blocks, ",")
+	let rows = try tx.Query("SELECT hash, size FROM blocks WHERE team_id = {team} AND NOT lost AND hash = ANY(string_to_array({csv}, ','))")
+	mut sizes = map[str]i64{}
+	for r in rows.Rows {
+		sizes[r[0].Text()] = r[1].Int()
+	}
+	mut total = 0
+	mut seen = map[str]bool{}
+	for b in blocks {
+		let (sz, ok) = sizes[b]
+		if !ok {
+			if !seen[b] {
+				missing = append(missing, b)
+				seen[b] = true
+			}
+			continue
+		}
+		total += sz
+	}
+	return missing, total
+}
+
+fn opBlocks(op proto.Op) []str {
+	mut out = []str{}
+	for b in op.Blocks {
+		let s str = b
+		out = append(out, s)
+	}
+	return out
+}
+
+fn parentOf(st state, op proto.Op) i64 {
+	if len(op.ParentOp) > 0 {
+		return st.created[op.ParentOp]
+	}
+	return op.Parent
+}
+
+// descendants is every live node below id, deepest first.
+fn descendants(tx mut postgres.Tx, team i64, id i64) ![]Node {
+	let rows = try tx.Query("WITH RECURSIVE down(id, depth) AS (SELECT id, 0 FROM nodes WHERE team_id = {team} AND parent_id = {id} AND deleted_seq IS NULL UNION ALL SELECT n.id, down.depth + 1 FROM nodes n JOIN down ON n.parent_id = down.id WHERE n.team_id = {team} AND n.deleted_seq IS NULL) SELECT n.id, coalesce(n.parent_id, 0), n.name, n.kind, n.hash, n.size, n.mtime_ns, n.rev, n.place_rev, 0 FROM down d JOIN nodes n ON n.team_id = {team} AND n.id = d.id ORDER BY d.depth DESC, n.id")
+	mut out = []Node{}
+	for r in rows.Rows {
+		out = append(out, scan(r))
+	}
+	return out
+}
+
+// filesDeleted is how many files a delete change would remove, 0 when it would remove none.
+fn filesDeleted(tx mut postgres.Tx, team i64, op proto.Op) !i64 {
+	if op.Op != "delete" || op.Node <= 0 {
+		return 0
+	}
+	let got = try loadIn(mut tx, team, op.Node)
+	if got == nil {
+		return 0
+	}
+	let n = got
+	if n.DeletedSeq != 0 || n.Parent == 0 {
+		return 0
+	}
+	if n.Kind != proto.KindDir {
+		return 1
+	}
+	let rows = try tx.Query("WITH RECURSIVE down(id, kind) AS (SELECT id, kind FROM nodes WHERE team_id = {team} AND parent_id = {n.Id} AND deleted_seq IS NULL UNION ALL SELECT n.id, n.kind FROM nodes n JOIN down ON n.parent_id = down.id WHERE n.team_id = {team} AND n.deleted_seq IS NULL) SELECT count(*) FROM down WHERE kind <> 1")
+	return rows.Rows[0][0].Int()
+}
+
+// Commit applies a batch of changes from device to the team's folder.
+fn Commit(c postgres.Client, team i64, device i64, in proto.CommitIn) !proto.CommitOut {
+	mut tx = try c.Begin()
+	let (o, err) = commitIn(mut tx, team, device, in)
+	if err != nil {
+		rollback(mut tx)
+		fail err
+	}
+	try tx.Commit()
+	return o
+}
+
+fn commitIn(tx mut postgres.Tx, team i64, device i64, in proto.CommitIn) !proto.CommitOut {
+	try lockTeam(mut tx, team)
+	let t = try tx.Query("SELECT head_seq FROM teams WHERE id = {team}")
+	if len(t.Rows) == 0 {
+		fail fault.Wrap(proto.ErrNotFound, "no team {team}")
+	}
+	mut st = state{team: team, device: device, seq: t.Rows[0][0].Int(), created: map[str]i64{}, dirty: map[i64]bool{}}
+	mut held = false
+	if !in.Confirmed {
+		mut deleting = 0
+		for op in in.Ops {
+			deleting += try filesDeleted(mut tx, team, op)
+		}
+		if deleting > 0 {
+			let live = try tx.Query("SELECT count(*) FROM nodes WHERE team_id = {team} AND deleted_seq IS NULL AND kind <> 1")
+			let files = live.Rows[0][0].Int()
+			held = deleting > GuardFiles || (deleting > GuardMin && deleting * 4 > files)
+		}
+	}
+	mut results = []proto.Result{}
+	for op in in.Ops {
+		let r = try apply(mut tx, mut st, op, held)
+		if r.Status == "ok" && len(op.OpId) > 0 && r.Node > 0 {
+			st.created[op.OpId] = r.Node
+		}
+		results = append(results, r)
+	}
+	let root = try rehash(mut tx, team, st.dirty)
+	let seq = st.seq
+	_ = try tx.Exec("UPDATE teams SET head_seq = {seq} WHERE id = {team}")
+	return proto.CommitOut{Results: results, Seq: seq, RootHash: root}
+}
+
+fn apply(tx mut postgres.Tx, st mut state, op proto.Op, held bool) !proto.Result {
+	if len(op.OpId) == 0 {
+		return status(op, "invalid", "every change needs an op_id")
+	}
+	let team = st.team
+	let opId = op.OpId
+	let done = try tx.Query("SELECT node_id, rev, place_rev, hash FROM journal WHERE team_id = {team} AND op_id = {opId} ORDER BY seq DESC LIMIT 1")
+	if len(done.Rows) == 1 {
+		let d = done.Rows[0]
+		return proto.Result{OpId: op.OpId, Status: "ok", Node: d[0].Int(), Rev: d[1].Int(), PlaceRev: d[2].Int(), Hash: d[3].Text(), Replayed: true, Missing: []str{}, Message: "", Current: nil}
+	}
+	if op.Op == "mkdir" {
+		return try mkdir(mut tx, mut st, op)
+	}
+	if op.Op == "create" {
+		return try create(mut tx, mut st, op)
+	}
+	if op.Op == "modify" {
+		return try modify(mut tx, mut st, op)
+	}
+	if op.Op == "move" {
+		return try move(mut tx, mut st, op)
+	}
+	if op.Op == "delete" {
+		return try remove(mut tx, mut st, op, held)
+	}
+	return status(op, "invalid", "unknown op {op.Op:q}: mkdir, create, modify, move or delete")
+}
+
+fn mkdir(tx mut postgres.Tx, st mut state, op proto.Op) !proto.Result {
+	let name = op.Name
+	let bad = proto.CheckName(name)
+	if bad != nil {
+		return status(op, "invalid", fault.Message(bad))
+	}
+	let parent = parentOf(st, op)
+	let dir = try liveDir(mut tx, st.team, parent)
+	if dir == nil {
+		return status(op, "not_found", "no folder {parent}")
+	}
+	let other = try taken(mut tx, st.team, parent, name, 0)
+	if other > 0 {
+		mut r = status(op, "name_taken", "{name:q} is taken in folder {parent}")
+		r.Node = other
+		let o = try loadIn(mut tx, st.team, other)
+		if o != nil {
+			r.Current = try current(mut tx, st.team, o)
+		}
+		return r
+	}
+	let seq = nextSeq(mut st)
+	let ids = try tx.Query("SELECT nextval('node_ids')")
+	let n = Node{Id: ids.Rows[0][0].Int(), Parent: parent, Name: name, Kind: proto.KindDir, Hash: proto.EmptyDirHash(), Size: 0, MtimeNs: op.MtimeNs, Rev: seq, PlaceRev: seq, DeletedSeq: 0}
+	try insertNode(mut tx, st.team, n)
+	try record(mut tx, st, op.OpId, "mkdir", n, seq)
+	st.dirty[parent] = true
+	return okResult(op, n)
+}
+
+fn insertNode(tx mut postgres.Tx, team i64, n Node) ! {
+	let key = proto.NameKey(n.Name)
+	_ = try tx.Exec("INSERT INTO nodes (team_id, id, parent_id, name, name_key, kind, hash, size, mtime_ns, rev, place_rev) VALUES ({team}, {n.Id}, {n.Parent}, {n.Name}, {key}, {n.Kind}, {n.Hash}, {n.Size}, {n.MtimeNs}, {n.Rev}, {n.PlaceRev})")
+}
+
+fn fileKind(k i64, fallback i64) i64 {
+	if k == proto.KindFile || k == proto.KindExec {
+		return k
+	}
+	return fallback
+}
+
+fn create(tx mut postgres.Tx, st mut state, op proto.Op) !proto.Result {
+	let name = op.Name
+	let bad = proto.CheckName(name)
+	if bad != nil {
+		return status(op, "invalid", fault.Message(bad))
+	}
+	let parent = parentOf(st, op)
+	let dir = try liveDir(mut tx, st.team, parent)
+	if dir == nil {
+		return status(op, "not_found", "no folder {parent}")
+	}
+	let other = try taken(mut tx, st.team, parent, name, 0)
+	if other > 0 {
+		mut r = status(op, "name_taken", "{name:q} is taken in folder {parent}")
+		r.Node = other
+		let o = try loadIn(mut tx, st.team, other)
+		if o != nil {
+			r.Current = try current(mut tx, st.team, o)
+		}
+		return r
+	}
+	let blocks = opBlocks(op)
+	let (missing, size) = try blockInfo(mut tx, st.team, blocks)
+	if len(missing) > 0 {
+		mut r = status(op, "missing_blocks", "upload these blocks, then send the change again")
+		r.Missing = missing
+		return r
+	}
+	let hash = try proto.FileHash(blocks)
+	let seq = nextSeq(mut st)
+	let ids = try tx.Query("SELECT nextval('node_ids')")
+	let n = Node{Id: ids.Rows[0][0].Int(), Parent: parent, Name: name, Kind: fileKind(op.Kind, proto.KindFile), Hash: hash, Size: size, MtimeNs: op.MtimeNs, Rev: seq, PlaceRev: seq, DeletedSeq: 0}
+	try insertNode(mut tx, st.team, n)
+	try addVersion(mut tx, st.team, st.device, n, blocks)
+	try record(mut tx, st, op.OpId, "create", n, seq)
+	st.dirty[parent] = true
+	return okResult(op, n)
+}
+
+fn modify(tx mut postgres.Tx, st mut state, op proto.Op) !proto.Result {
+	let got = try loadIn(mut tx, st.team, op.Node)
+	if got == nil {
+		return status(op, "not_found", "no node {op.Node}")
+	}
+	let n = got
+	if n.DeletedSeq != 0 {
+		return status(op, "not_found", "node {op.Node} is in the trash")
+	}
+	if n.Kind == proto.KindDir {
+		return status(op, "invalid", "node {op.Node} is a folder: modify changes a file's content")
+	}
+	if op.BaseRev != n.Rev {
+		return try conflict(mut tx, st.team, op, n, "the file changed since rev {op.BaseRev}: it is at rev {n.Rev}")
+	}
+	let blocks = opBlocks(op)
+	let (missing, size) = try blockInfo(mut tx, st.team, blocks)
+	if len(missing) > 0 {
+		mut r = status(op, "missing_blocks", "upload these blocks, then send the change again")
+		r.Missing = missing
+		return r
+	}
+	let hash = try proto.FileHash(blocks)
+	let kind = fileKind(op.Kind, n.Kind)
+	if hash == n.Hash && kind == n.Kind {
+		return okResult(op, n)
+	}
+	let seq = nextSeq(mut st)
+	let m = Node{Id: n.Id, Parent: n.Parent, Name: n.Name, Kind: kind, Hash: hash, Size: size, MtimeNs: op.MtimeNs, Rev: seq, PlaceRev: n.PlaceRev, DeletedSeq: 0}
+	let team = st.team
+	_ = try tx.Exec("UPDATE nodes SET kind = {m.Kind}, hash = {m.Hash}, size = {m.Size}, mtime_ns = {m.MtimeNs}, rev = {m.Rev} WHERE team_id = {team} AND id = {m.Id}")
+	try addVersion(mut tx, team, st.device, m, blocks)
+	try record(mut tx, st, op.OpId, "modify", m, seq)
+	st.dirty[n.Parent] = true
+	return okResult(op, m)
+}
+
+fn move(tx mut postgres.Tx, st mut state, op proto.Op) !proto.Result {
+	let got = try loadIn(mut tx, st.team, op.Node)
+	if got == nil {
+		return status(op, "not_found", "no node {op.Node}")
+	}
+	let n = got
+	if n.DeletedSeq != 0 {
+		return status(op, "not_found", "node {op.Node} is in the trash")
+	}
+	if n.Parent == 0 {
+		return status(op, "invalid", "the root folder cannot move")
+	}
+	if op.BasePlaceRev != n.PlaceRev {
+		return try conflict(mut tx, st.team, op, n, "the item moved since place_rev {op.BasePlaceRev}: it is at {n.PlaceRev}")
+	}
+	mut parent = parentOf(st, op)
+	if parent == 0 {
+		parent = n.Parent
+	}
+	mut name str = op.Name
+	if len(name) == 0 {
+		name = n.Name
+	}
+	let bad = proto.CheckName(name)
+	if bad != nil {
+		return status(op, "invalid", fault.Message(bad))
+	}
+	let dir = try liveDir(mut tx, st.team, parent)
+	if dir == nil {
+		return status(op, "not_found", "no folder {parent}")
+	}
+	if parent == n.Parent && name == n.Name {
+		return okResult(op, n)
+	}
+	if n.Kind == proto.KindDir {
+		let inside = try isWithin(mut tx, st.team, n.Id, parent)
+		if inside {
+			return status(op, "invalid", "a folder cannot move inside itself")
+		}
+	}
+	let other = try taken(mut tx, st.team, parent, name, n.Id)
+	if other > 0 {
+		mut r = status(op, "name_taken", "{name:q} is taken in folder {parent}")
+		r.Node = other
+		return r
+	}
+	let seq = nextSeq(mut st)
+	let m = Node{Id: n.Id, Parent: parent, Name: name, Kind: n.Kind, Hash: n.Hash, Size: n.Size, MtimeNs: n.MtimeNs, Rev: n.Rev, PlaceRev: seq, DeletedSeq: 0}
+	let team = st.team
+	let key = proto.NameKey(name)
+	_ = try tx.Exec("UPDATE nodes SET parent_id = {parent}, name = {name}, name_key = {key}, place_rev = {seq} WHERE team_id = {team} AND id = {m.Id}")
+	try record(mut tx, st, op.OpId, "move", m, seq)
+	st.dirty[n.Parent] = true
+	st.dirty[parent] = true
+	return okResult(op, m)
+}
+
+fn remove(tx mut postgres.Tx, st mut state, op proto.Op, held bool) !proto.Result {
+	let got = try loadIn(mut tx, st.team, op.Node)
+	if got == nil {
+		return status(op, "not_found", "no node {op.Node}")
+	}
+	let n = got
+	if n.DeletedSeq != 0 {
+		mut r = okResult(op, n)
+		r.Message = "already in the trash"
+		return r
+	}
+	if n.Parent == 0 {
+		return status(op, "invalid", "the root folder cannot be deleted")
+	}
+	if held {
+		return status(op, "confirm_required", "this batch deletes a large part of the folder: ask, then send it again with \"confirmed\": true")
+	}
+	if n.Kind == proto.KindDir {
+		if op.BaseHash != n.Hash {
+			return try conflict(mut tx, st.team, op, n, "the folder's content changed since you looked: its hash is {n.Hash}")
+		}
+	} else if op.BaseRev != n.Rev {
+		return try conflict(mut tx, st.team, op, n, "the file changed since rev {op.BaseRev}: edits win over deletes")
+	}
+	mut below = []Node{}
+	if n.Kind == proto.KindDir {
+		below = try descendants(mut tx, st.team, n.Id)
+	}
+	mut seqs = []i64{}
+	for i in 0..len(below) {
+		seqs = append(seqs, nextSeq(mut st) + 0 * i)
+	}
+	let mark = nextSeq(mut st)
+	let team = st.team
+	for i, d in below {
+		let gone = Node{Id: d.Id, Parent: d.Parent, Name: d.Name, Kind: d.Kind, Hash: d.Hash, Size: d.Size, MtimeNs: d.MtimeNs, Rev: d.Rev, PlaceRev: d.PlaceRev, DeletedSeq: mark}
+		_ = try tx.Exec("UPDATE nodes SET deleted_seq = {mark} WHERE team_id = {team} AND id = {d.Id}")
+		try record(mut tx, st, op.OpId, "delete", gone, seqs[i])
+	}
+	let m = Node{Id: n.Id, Parent: n.Parent, Name: n.Name, Kind: n.Kind, Hash: n.Hash, Size: n.Size, MtimeNs: n.MtimeNs, Rev: n.Rev, PlaceRev: n.PlaceRev, DeletedSeq: mark}
+	_ = try tx.Exec("UPDATE nodes SET deleted_seq = {mark} WHERE team_id = {team} AND id = {n.Id}")
+	try record(mut tx, st, op.OpId, "delete", m, mark)
+	st.dirty[n.Parent] = true
+	return okResult(op, m)
+}

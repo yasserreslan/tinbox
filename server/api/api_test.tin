@@ -1,0 +1,11 @@
+package api
+
+import "anvil"
+import "crucible"
+
+fn TestRoutes(t mut crucible.T) {
+	mut r = anvil.NewRouter()
+	Mount(mut r)
+	t.NoFault("patterns", r.Check())
+	crucible.Equal(mut t, "match", r.Match("GET", "/v1/teams/3/nodes/9/children"), `/v1/teams/{team}/nodes/{id}/children`)
+}
