@@ -6,6 +6,7 @@ import "fault"
 import "quarry"
 import "say"
 import "seal"
+import "tide"
 import "twine"
 import "wire"
 
@@ -397,6 +398,14 @@ fn run(t mut Tally) ! {
 	t.check("revoke the second Mac", rv.Status == 200, rv.Body)
 	let after = try call(b, "GET", "/v1/teams/{team}/head", "")
 	t.check("a revoked Mac is refused", after.Status == 401, "{after.Status}")
+	// 24. with TINBOX_E2E_LONG=1: a wait that finds nothing new holds for 55 s, through any proxy in front
+	if quarry.Getenv("TINBOX_E2E_LONG") == "1" {
+		let now = try head(a, team)
+		let started = tide.Now()
+		let lw = try call(a, "GET", "/v1/teams/{team}/wait?cursor={now.Seq}", "")
+		let took = tide.Since(started) / tide.Second
+		t.check("a 55 s wait survives the way to the server", lw.Status == 200 && took >= 50, "{lw.Status} after {took} s: {lw.Body}")
+	}
 }
 
 fn main() {
