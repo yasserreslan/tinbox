@@ -17,6 +17,14 @@ jobs:
           key: tin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TIN_VERSION') }}
       - name: Unit tests and builds
         run: scripts/test.sh
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/tinbox/minio-bin
+          key: minio-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/local.sh') }}
       - name: End to end against Postgres and MinIO
         run: tests/local.sh
       - name: Container image
