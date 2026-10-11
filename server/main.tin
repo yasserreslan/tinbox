@@ -138,6 +138,13 @@ fn jobs(round i64) {
 		if swept > 0 {
 			herald.Log(herald.LInfo, "sweep", []str{"team", say.Str(t), "blocks", say.Str(swept)})
 		}
+		let abandoned = tree.SweepUploads(pg, blobs, t) catch err {
+			herald.Log(herald.LError, "sweep uploads", []str{"team", say.Str(t), "error", fault.Message(err)})
+			0
+		}
+		if abandoned > 0 {
+			herald.Log(herald.LInfo, "sweep uploads", []str{"team", say.Str(t), "uploads", say.Str(abandoned)})
+		}
 		if !daily {
 			continue
 		}

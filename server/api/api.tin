@@ -864,6 +864,48 @@ fn urls(q anvil.Req, w mut anvil.Out) {
 	sendJSON(mut w, o)
 }
 
+fn putPart(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let part = mint.Atoi(q.PathParam("part")) catch _ {
+		-1
+	}
+	let body = q.Body()
+	tree.PutPart(d.Db, d.Store, teamOf(q), q.PathParam("hash"), part, body) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, BlockOut{Hash: q.PathParam("hash"), Size: len(body)})
+}
+
+fn completeUpload(q anvil.Req, w mut anvil.Out) {
+	let who = member(q, mut w, false)
+	if who == nil {
+		return
+	}
+	mut in = tree.PartsIn{}
+	argo.GetStrict(q.Body(), mut in) catch err {
+		badRequest(q, mut w, fault.Message(err))
+		return
+	}
+	let d = current() catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	let hash = q.PathParam("hash")
+	let size = tree.CompleteUpload(d.Db, d.Store, teamOf(q), hash, in.Parts) catch err {
+		sendFault(q, mut w, err)
+		return
+	}
+	sendJSON(mut w, BlockOut{Hash: hash, Size: size})
+}
+
 // Mount adds every route to r.
 fn Mount(r mut anvil.Router) {
 	r.Get("/healthz", healthz)
@@ -894,4 +936,6 @@ fn Mount(r mut anvil.Router) {
 	r.Post(`/v1/teams/{team}/blocks/urls`, urls)
 	r.Put(`/v1/teams/{team}/blocks/{hash}`, putBlock)
 	r.Get(`/v1/teams/{team}/blocks/{hash}`, getBlock)
+	r.Put(`/v1/teams/{team}/uploads/{hash}/{part}`, putPart)
+	r.Post(`/v1/teams/{team}/uploads/{hash}/complete`, completeUpload)
 }

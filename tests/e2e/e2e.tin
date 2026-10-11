@@ -398,7 +398,21 @@ fn run(t mut Tally) ! {
 	t.check("revoke the second Mac", rv.Status == 200, rv.Body)
 	let after = try call(b, "GET", "/v1/teams/{team}/head", "")
 	t.check("a revoked Mac is refused", after.Status == 401, "{after.Status}")
-	// 24. with TINBOX_E2E_LONG=1: a wait that finds nothing new holds for 55 s, through any proxy in front
+	// 24. a block uploaded in parts, as a client that limits its speed sends it
+	let content3 = twine.Repeat("part data ", 2000)
+	let h3 = proto.BlockHash(content3)
+	let p0 = try call(a, "PUT", "/v1/teams/{team}/uploads/{h3}/0", content3[0:7000])
+	let p1 = try call(a, "PUT", "/v1/teams/{team}/uploads/{h3}/1", content3[7000:14000])
+	let p2 = try call(a, "PUT", "/v1/teams/{team}/uploads/{h3}/2", content3[14000:])
+	t.check("upload three parts", p0.Status == 200 && p1.Status == 200 && p2.Status == 200, "{p0.Status} {p1.Status} {p2.Status}")
+	let short = try call(a, "POST", "/v1/teams/{team}/uploads/{h3}/complete", `{"parts":2}`)
+	t.check("completing with a part missing is refused", short.Status == 422, "{short.Status} {short.Body}")
+	let p2again = try call(a, "PUT", "/v1/teams/{team}/uploads/{h3}/2", content3[14000:])
+	let done = try call(a, "POST", "/v1/teams/{team}/uploads/{h3}/complete", `{"parts":3}`)
+	t.check("complete the upload", p2again.Status == 200 && done.Status == 200 && twine.Contains(done.Body, "20000"), "{done.Status} {done.Body}")
+	let miss3 = try call(a, "POST", "/v1/teams/{team}/blocks/missing", `{"hashes":[` + quote(h3) + "]}}")
+	t.check("the joined block is stored", miss3.Body == `{"missing":[]}`, miss3.Body)
+	// 25. with TINBOX_E2E_LONG=1: a wait that finds nothing new holds for 55 s, through any proxy in front
 	if quarry.Getenv("TINBOX_E2E_LONG") == "1" {
 		let now = try head(a, team)
 		let started = tide.Now()

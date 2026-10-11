@@ -1,0 +1,82 @@
+package tree
+
+import "../../proto"
+import "../store"
+import "fault"
+import "postgres"
+
+// Uploads in parts: a client that limits its upload speed sends a block as small parts, each request a few seconds
+// long however slow the link, so no request outlives a proxy's timeout. The parts wait in the store; completing the
+// upload joins them, checks the hash and stores the block as PutBlock does.
+
+// MaxPart is the most bytes one part may have; MaxParts how many parts one block may have.
+const MaxPart = 1048576
+const MaxParts = 4096
+
+// PartsIn is the body of POST .../uploads/{hash}/complete.
+type PartsIn struct {
+	@json("parts") Parts i64
+}
+
+fn partKey(team i64, hash str, part i64) str {
+	return "uploads/{team}/{hash}/{part}"
+}
+
+// PutPart stores one part of a block's upload.
+fn PutPart(c postgres.Client, s store.Store, team i64, hash str, part i64, data str) ! {
+	if !proto.ValidHash(hash) {
+		fail fault.Wrap(proto.ErrInvalid, "{hash:q} is not a hex SHA-256")
+	}
+	if part < 0 || part >= MaxParts {
+		fail fault.Wrap(proto.ErrInvalid, "a part number is 0 to {MaxParts - 1}")
+	}
+	if len(data) == 0 || len(data) > MaxPart {
+		fail fault.Wrap(proto.ErrTooLarge, "a part has 1 to {MaxPart} bytes, not {len(data)}")
+	}
+	_ = try c.Exec("INSERT INTO uploads (team_id, hash) VALUES ({team}, {hash}) ON CONFLICT (team_id, hash) DO NOTHING")
+	try s.Put(partKey(team, hash, part), data)
+}
+
+// CompleteUpload joins parts 0 to parts-1 of a block's upload, stores the block (which checks its hash and the
+// quota) and removes the parts. It returns the block's size.
+fn CompleteUpload(c postgres.Client, s store.Store, team i64, hash str, parts i64) !i64 {
+	if !proto.ValidHash(hash) {
+		fail fault.Wrap(proto.ErrInvalid, "{hash:q} is not a hex SHA-256")
+	}
+	if parts < 1 || parts > MaxParts {
+		fail fault.Wrap(proto.ErrInvalid, "an upload has 1 to {MaxParts} parts")
+	}
+	mut data = make([]u8, 0, store.MaxBlock)
+	for i in 0..parts {
+		let p = s.Get(partKey(team, hash, i)) catch err {
+			if fault.Is(err, proto.ErrNotFound) {
+				fail fault.Wrap(proto.ErrNotFound, "part {i} of {hash} was not uploaded")
+			}
+			fail err
+		}
+		if len(data) + len(p) > store.MaxBlock {
+			fail fault.Wrap(proto.ErrTooLarge, "the parts add up to more than {store.MaxBlock} bytes")
+		}
+		data = append(data, []u8(p)...)
+	}
+	try PutBlock(c, s, team, hash, str(data))
+	try dropUpload(c, s, team, hash)
+	return len(data)
+}
+
+fn dropUpload(c postgres.Client, s store.Store, team i64, hash str) ! {
+	let objs = try s.List("uploads/{team}/{hash}/")
+	for o in objs {
+		try s.Delete(o.Key)
+	}
+	_ = try c.Exec("DELETE FROM uploads WHERE team_id = {team} AND hash = {hash}")
+}
+
+// SweepUploads removes the parts of uploads started more than a day ago and never completed.
+fn SweepUploads(c postgres.Client, s store.Store, team i64) !i64 {
+	let rows = try c.Query("SELECT hash FROM uploads WHERE team_id = {team} AND started_at < now() - interval '1 day' LIMIT 500")
+	for r in rows.Rows {
+		try dropUpload(c, s, team, r[0].Text())
+	}
+	return len(rows.Rows)
+}

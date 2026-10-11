@@ -163,7 +163,12 @@ reference implementation.
 | `PUT /v1/teams/{t}/blocks/{sha256}` raw bytes | member | one block of at most 4 MiB, hashed before it is stored |
 | `POST /v1/teams/{t}/blocks/urls` `{hashes}` | member | a download URL per block, valid 15 minutes |
 | `GET /v1/teams/{t}/blocks/{sha256}` | member | a block through the server |
+| `PUT /v1/teams/{t}/uploads/{sha256}/{part}` raw bytes | member | one part (at most 1 MiB, parts 0 to 4095) of a block sent in parts |
+| `POST /v1/teams/{t}/uploads/{sha256}/complete` `{parts}` | member | joins parts 0 to parts-1, checks the hash like a PUT, removes the parts |
 | `POST /v1/teams/{t}/commit` `{ops, confirmed}` | member | a batch of changes (section 7) |
+
+A client that limits its upload speed sends blocks in parts, so each request lasts seconds however slow the link
+and none outlives a proxy's timeout. Parts never completed are removed by the hourly sweep after a day.
 
 A new Mac reads the head seq S, pages through `snapshot`, then applies `delta` from S: changes made while it paged
 arrive in the delta, and applying them again is harmless. After that it applies `delta` and waits on `wait`.
